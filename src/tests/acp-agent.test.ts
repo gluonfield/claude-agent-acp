@@ -1545,6 +1545,7 @@ describe("stop reason propagation", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       textStreamedMessageIds: new Set<string>(),
+      fallbackEmittedBlockKeys: new Set<string>(),
     };
   }
 
@@ -1690,6 +1691,7 @@ describe("stop reason propagation", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       textStreamedMessageIds: new Set<string>(),
+      fallbackEmittedBlockKeys: new Set<string>(),
     };
 
     const response = await agent.prompt({
@@ -1863,6 +1865,7 @@ describe("assistant text fallback when streaming yields no text deltas", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       textStreamedMessageIds: new Set<string>(),
+      fallbackEmittedBlockKeys: new Set<string>(),
     };
   }
 
@@ -1892,6 +1895,13 @@ describe("assistant text fallback when streaming yields no text deltas", () => {
   }
 
   function makeAssistantMessage(messageId: string, text: string) {
+    return makeAssistantMessageWithBlocks(messageId, [{ type: "text", text }]);
+  }
+
+  // Same as makeAssistantMessage but with arbitrary content blocks, so tests
+  // can reproduce gateways that split a single response (one message id) into
+  // several `assistant` messages each carrying a different block.
+  function makeAssistantMessageWithBlocks(messageId: string, content: any[]) {
     return {
       type: "assistant" as const,
       parent_tool_use_id: null,
@@ -1902,7 +1912,7 @@ describe("assistant text fallback when streaming yields no text deltas", () => {
         type: "message" as const,
         role: "assistant" as const,
         model: "claude-test",
-        content: [{ type: "text", text }],
+        content,
         stop_reason: "end_turn",
         stop_sequence: null,
         usage: {
@@ -2081,6 +2091,126 @@ describe("assistant text fallback when streaming yields no text deltas", () => {
     // Two turns each fallback-emit once.
     expect(textChunks.length).toBe(2);
   });
+
+  it("emits the text block when it arrives in a later same-id message than the thinking block", async () => {
+    // Production regression (OpenAI-compatible gpt-5 gateway): a single
+    // assistant response (one message id) is delivered as *separate*
+    // `assistant` messages — an empty `thinking` block first, then the real
+    // `text` block — both sharing the same id and neither streamed via
+    // content_block_delta. Deduping at message-id granularity flagged the id
+    // on the thinking block and then dropped the text, so the client saw the
+    // fallback fire but received an empty answer. The fallback must key on the
+    // block contents so the later text block is still emitted.
+    const { agent, notifications } = createCapturingAgent();
+    const messageId = "resp_split_blocks";
+    const finalText = "=== Ticket Review Summary === approved";
+    injectSession(agent, [
+      makeAssistantMessageWithBlocks(messageId, [
+        { type: "thinking", thinking: "", signature: "sig" },
+      ]),
+      makeAssistantMessageWithBlocks(messageId, [{ type: "text", text: finalText }]),
+      makeResult(),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "go" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    const textChunks = notifications
+      .map((n) => n.update)
+      .filter(
+        (u) =>
+          u.sessionUpdate === "agent_message_chunk" &&
+          u.content.type === "text" &&
+          u.content.text === finalText,
+      );
+    expect(textChunks.length).toBe(1);
+  });
+
+  it("emits distinct text blocks that share a message id", async () => {
+    // A gateway may split a multi-block answer (thinking + text + a second
+    // text) across same-id messages. Every distinct text block must reach the
+    // client exactly once.
+    const { agent, notifications } = createCapturingAgent();
+    const messageId = "resp_multi_text";
+    const firstText = "我先直接执行审批并返回工单结果。";
+    const secondText = "Ticket approved.";
+    injectSession(agent, [
+      makeAssistantMessageWithBlocks(messageId, [
+        { type: "thinking", thinking: "considering options", signature: "sig" },
+      ]),
+      makeAssistantMessageWithBlocks(messageId, [{ type: "text", text: firstText }]),
+      makeAssistantMessageWithBlocks(messageId, [{ type: "text", text: secondText }]),
+      makeResult(),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "go" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    const updates = notifications.map((n) => n.update);
+    const firstChunks = updates.filter(
+      (u) =>
+        u.sessionUpdate === "agent_message_chunk" &&
+        u.content.type === "text" &&
+        u.content.text === firstText,
+    );
+    const secondChunks = updates.filter(
+      (u) =>
+        u.sessionUpdate === "agent_message_chunk" &&
+        u.content.type === "text" &&
+        u.content.text === secondText,
+    );
+    expect(firstChunks.length).toBe(1);
+    expect(secondChunks.length).toBe(1);
+  });
+
+  it("does not duplicate text when an incremental block is followed by a consolidated message", async () => {
+    // Some gateways deliver an incremental per-block `assistant` message and
+    // then a consolidated `assistant` message (same id) that repeats that
+    // block alongside others. The repeated block must not be emitted twice.
+    const { agent, notifications } = createCapturingAgent();
+    const messageId = "resp_consolidated";
+    const thinking = "step-by-step reasoning";
+    const finalText = "the answer";
+    injectSession(agent, [
+      makeAssistantMessageWithBlocks(messageId, [{ type: "text", text: finalText }]),
+      makeAssistantMessageWithBlocks(messageId, [
+        { type: "thinking", thinking, signature: "sig" },
+        { type: "text", text: finalText },
+      ]),
+      makeResult(),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "go" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    const updates = notifications.map((n) => n.update);
+    const textChunks = updates.filter(
+      (u) =>
+        u.sessionUpdate === "agent_message_chunk" &&
+        u.content.type === "text" &&
+        u.content.text === finalText,
+    );
+    const thoughtChunks = updates.filter(
+      (u) =>
+        u.sessionUpdate === "agent_thought_chunk" &&
+        u.content.type === "text" &&
+        u.content.text === thinking,
+    );
+    expect(textChunks.length).toBe(1);
+    expect(thoughtChunks.length).toBe(1);
+  });
 });
 
 describe("session/close", () => {
@@ -2125,6 +2255,7 @@ describe("session/close", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       textStreamedMessageIds: new Set<string>(),
+      fallbackEmittedBlockKeys: new Set<string>(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -2210,6 +2341,7 @@ describe("session/delete", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       textStreamedMessageIds: new Set<string>(),
+      fallbackEmittedBlockKeys: new Set<string>(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -2312,6 +2444,7 @@ describe("getOrCreateSession param change detection", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       textStreamedMessageIds: new Set<string>(),
+      fallbackEmittedBlockKeys: new Set<string>(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -2548,6 +2681,7 @@ describe("usage_update computation", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       textStreamedMessageIds: new Set<string>(),
+      fallbackEmittedBlockKeys: new Set<string>(),
     };
   }
 
@@ -3449,6 +3583,7 @@ describe("emitRawSDKMessages", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       textStreamedMessageIds: new Set<string>(),
+      fallbackEmittedBlockKeys: new Set<string>(),
     };
   }
 
@@ -3678,6 +3813,7 @@ describe("result origin handling", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       textStreamedMessageIds: new Set<string>(),
+      fallbackEmittedBlockKeys: new Set<string>(),
     };
   }
 
@@ -3854,6 +3990,7 @@ describe("memory_recall handling", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       textStreamedMessageIds: new Set<string>(),
+      fallbackEmittedBlockKeys: new Set<string>(),
     };
   }
 
@@ -4085,6 +4222,7 @@ describe("post-error recovery", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       textStreamedMessageIds: new Set<string>(),
+      fallbackEmittedBlockKeys: new Set<string>(),
     };
     return { interrupt };
   }

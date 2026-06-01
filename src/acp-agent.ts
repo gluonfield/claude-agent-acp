@@ -172,6 +172,17 @@ type Session = {
    *  back to emitting the assembled blocks (when the underlying SDK / model
    *  proxy never produced `content_block_delta` for them). */
   textStreamedMessageIds: Set<string>;
+  /** Keys of assembled text/thinking blocks the fallback path has already
+   *  forwarded this turn, used to dedup re-delivered blocks without dropping
+   *  genuinely new ones. A single assistant message id is frequently
+   *  delivered as several `assistant` messages, each carrying a *different*
+   *  subset of content blocks (e.g. an empty `thinking` block, then the real
+   *  `text` block); deduping at message-id granularity would emit the first
+   *  block, flag the id, then silently drop the later text. Keying on the
+   *  block content instead lets distinct blocks that share an id all through
+   *  while still collapsing identical re-deliveries (incremental + consolidated
+   *  messages, or the same message delivered twice). */
+  fallbackEmittedBlockKeys: Set<string>;
   /** Id of the assistant message currently being streamed via `stream_event`
    *  partial messages, captured at `message_start` so subsequent
    *  `content_block_delta` events can record their parent into
@@ -755,10 +766,12 @@ export class ClaudeAcpAgent implements Agent {
       cachedWriteTokens: 0,
     };
 
-    // Assistant message ids are turn-scoped — clear before a new turn so the
-    // set doesn't grow unboundedly over a long-lived session, and so that an
-    // id reused across turns (uncommon but possible) is re-evaluated.
+    // Assistant message ids and fallback block keys are turn-scoped — clear
+    // before a new turn so the sets don't grow unboundedly over a long-lived
+    // session, and so that an id reused across turns (uncommon but possible)
+    // is re-evaluated.
     session.textStreamedMessageIds.clear();
+    session.fallbackEmittedBlockKeys.clear();
     session.currentStreamingMessageId = undefined;
 
     let lastAssistantTotalUsage: number | null = null;
@@ -1270,49 +1283,61 @@ export class ClaudeAcpAgent implements Agent {
             // (e.g. because the underlying model proxy returned the response
             // as a single non-streamed block, which is common with OpenAI-
             // compatible gateways translating to the Anthropic protocol), the
-            // delta path emitted nothing — falling through with the filter in
-            // place would drop the assistant's final text on the floor while
-            // still returning `stopReason: "end_turn"`. Detect that case via
+            // delta path emitted nothing — filtering the assembled blocks out
+            // would drop the assistant's final text on the floor while still
+            // returning `stopReason: "end_turn"`. Detect that case via
             // `textStreamedMessageIds` and emit the assembled blocks as a
             // fallback.
+            //
+            // The fallback dedup must be per content block, not per message
+            // id: such gateways frequently deliver one assistant response as
+            // several `assistant` messages that *share a message id* but each
+            // carry a *different* block (e.g. an empty `thinking` block, then
+            // the real `text` block). Flagging the whole id after the first
+            // block would emit that block, then silently drop the real text
+            // arriving under the same id. So we key the dedup on the block
+            // contents, which lets distinct blocks through while still
+            // collapsing identical re-deliveries (an incremental block
+            // followed by a consolidated message, or the same message
+            // delivered twice).
             const assistantMessageId =
               message.type === "assistant" ? message.message.id : undefined;
-            const textAlreadyStreamed =
+            const liveStreamed =
               !!assistantMessageId && session.textStreamedMessageIds.has(assistantMessageId);
 
-            if (
-              message.type === "assistant" &&
-              !textAlreadyStreamed &&
-              Array.isArray(message.message.content) &&
-              message.message.content.some(
-                (item) => item.type === "text" || item.type === "thinking",
-              )
-            ) {
+            let emittedFallbackBlock = false;
+            const content =
+              message.type === "assistant"
+                ? message.message.content.filter((item) => {
+                    if (item.type !== "text" && item.type !== "thinking") {
+                      return true;
+                    }
+                    // Already delivered live via streaming deltas — drop the
+                    // assembled copy to avoid duplication.
+                    if (liveStreamed) {
+                      return false;
+                    }
+                    // Fallback path: emit each assembled block once, keyed on
+                    // its contents so re-delivered blocks dedup but distinct
+                    // blocks sharing a message id are all forwarded.
+                    const blockText = item.type === "text" ? item.text : item.thinking;
+                    const key = `${assistantMessageId ?? "<unknown>"}\u0000${item.type}\u0000${blockText}`;
+                    if (session.fallbackEmittedBlockKeys.has(key)) {
+                      return false;
+                    }
+                    session.fallbackEmittedBlockKeys.add(key);
+                    emittedFallbackBlock = true;
+                    return true;
+                  })
+                : message.message.content;
+
+            if (emittedFallbackBlock) {
               this.logger.log(
                 `[claude-agent-acp] No streamed text/thinking deltas seen for ` +
                   `assistant message ${assistantMessageId ?? "<unknown>"}; ` +
                   `emitting assembled blocks as fallback.`,
               );
-              // After this fallback emits, mark the id so a duplicate
-              // `assistant` delivery of the same message doesn't re-emit the
-              // same text/thinking blocks. Mirrors the dedupe semantics that
-              // streaming-emitted ids already have.
-              if (assistantMessageId) {
-                session.textStreamedMessageIds.add(assistantMessageId);
-              }
             }
-
-            const content =
-              message.type === "assistant"
-                ? message.message.content.filter((item) => {
-                    if (item.type === "text" || item.type === "thinking") {
-                      // Keep only when the stream_event path didn't already
-                      // emit chunks for this message id.
-                      return !textAlreadyStreamed;
-                    }
-                    return true;
-                  })
-                : message.message.content;
 
             for (const notification of toAcpNotifications(
               content,
@@ -2338,6 +2363,7 @@ export class ClaudeAcpAgent implements Agent {
         inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
       taskState,
       textStreamedMessageIds: new Set<string>(),
+      fallbackEmittedBlockKeys: new Set<string>(),
     };
 
     return {
