@@ -2923,7 +2923,7 @@ describe("usage_update computation", () => {
       session_id: "test-session",
       event:
         eventType === "message_start"
-          ? { type: "message_start" as const, message: payload }
+          ? { type: "message_start" as const, message: { id: randomUUID(), ...payload } }
           : { type: "message_delta" as const, ...payload },
     };
   }
@@ -5793,12 +5793,10 @@ describe("toAcpNotifications messageId", () => {
     });
   });
 
-  it("generates messageId when none is supplied", () => {
-    const result = toAcpNotifications("hello", "assistant", "test", {}, {} as AcpClient, console);
-    expect(result[0].update).toMatchObject({
-      sessionUpdate: "agent_message_chunk",
-      messageId: expect.stringMatching(/^claude:test:assistant:/),
-    });
+  it("rejects message chunks without messageId", () => {
+    expect(() =>
+      toAcpNotifications("hello", "assistant", "test", {}, {} as AcpClient, console),
+    ).toThrow("agent_message_chunk messageId is required");
   });
 
   it("never sets messageId on non-chunk updates (tool_call)", () => {
@@ -5832,6 +5830,7 @@ describe("toAcpNotifications thinking chunks", () => {
       {},
       {} as AcpClient,
       console,
+      { messageId: "message-1" },
     );
 
     expect(result).toEqual([
@@ -5839,7 +5838,7 @@ describe("toAcpNotifications thinking chunks", () => {
         sessionId: "test",
         update: {
           sessionUpdate: "agent_thought_chunk",
-          messageId: expect.stringMatching(/^claude:test:assistant:/),
+          messageId: "message-1",
           content: { type: "text", text: "let me reason" },
         },
       },
