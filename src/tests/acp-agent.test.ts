@@ -3860,6 +3860,36 @@ describe("usage_update computation", () => {
     expect(usageUpdate.update.size).toBe(200000);
     expect(session.contextWindowSize).toBe(200000);
   });
+
+  it("tags synthetic compaction chunks with one messageId", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "status",
+        session_id: "test-session",
+        status: "compacting",
+      },
+      {
+        type: "system",
+        subtype: "status",
+        session_id: "test-session",
+        compact_result: "success",
+      },
+      createResultMessageWithModel({ modelUsage: {} }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const chunks = updates.filter((u: any) => u.update?.sessionUpdate === "agent_message_chunk");
+    expect(chunks.map((u: any) => u.update.content.text)).toEqual([
+      "Compacting...",
+      "\n\nCompacting completed.",
+    ]);
+    expect(chunks[0].update.messageId).toMatch(/^claude:test-session:compaction:/);
+    expect(chunks[1].update.messageId).toBe(chunks[0].update.messageId);
+  });
 });
 
 describe("assembled assistant text fallback", () => {
@@ -5763,9 +5793,12 @@ describe("toAcpNotifications messageId", () => {
     });
   });
 
-  it("omits messageId when none is supplied", () => {
+  it("generates messageId when none is supplied", () => {
     const result = toAcpNotifications("hello", "assistant", "test", {}, {} as AcpClient, console);
-    expect(result[0].update).not.toHaveProperty("messageId");
+    expect(result[0].update).toMatchObject({
+      sessionUpdate: "agent_message_chunk",
+      messageId: expect.stringMatching(/^claude:test:assistant:/),
+    });
   });
 
   it("never sets messageId on non-chunk updates (tool_call)", () => {
@@ -5806,6 +5839,7 @@ describe("toAcpNotifications thinking chunks", () => {
         sessionId: "test",
         update: {
           sessionUpdate: "agent_thought_chunk",
+          messageId: expect.stringMatching(/^claude:test:assistant:/),
           content: { type: "text", text: "let me reason" },
         },
       },
