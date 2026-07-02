@@ -1081,6 +1081,7 @@ export class ClaudeAcpAgent {
     // compaction, and the two messages are indistinguishable — so we report the
     // outcome only while a compaction is in progress, then clear this.
     let compactionInProgress = false;
+    let compactionMessageId: string | undefined;
     // Anthropic API message id of the assistant message currently being
     // streamed, captured from `message_start` so the streamed chunks that follow
     // (whose delta events don't carry it) can all be tagged with the same,
@@ -1108,6 +1109,7 @@ export class ClaudeAcpAgent {
       lastAssistantError = undefined;
       lastRefusalExplanation = null;
       compactionInProgress = false;
+      compactionMessageId = undefined;
       // Do NOT reset currentStreamMessageId or streamedBlocks here. Turn
       // activation can fire mid-message (the replayed user echo with
       // --replay-user-messages lands between a message's blocks); clearing the
@@ -1313,10 +1315,16 @@ export class ClaudeAcpAgent {
               case "status": {
                 if (message.status === "compacting") {
                   compactionInProgress = true;
+                  compactionMessageId = syntheticMessageId(
+                    message.session_id,
+                    "compaction",
+                    randomUUID(),
+                  );
                   await this.client.sessionUpdate({
                     sessionId: message.session_id,
                     update: {
                       sessionUpdate: "agent_message_chunk",
+                      messageId: compactionMessageId,
                       content: { type: "text", text: "Compacting..." },
                     },
                   });
@@ -1329,9 +1337,13 @@ export class ClaudeAcpAgent {
                     sessionId: message.session_id,
                     update: {
                       sessionUpdate: "agent_message_chunk",
+                      messageId:
+                        compactionMessageId ??
+                        syntheticMessageId(message.session_id, "compaction", randomUUID()),
                       content: { type: "text", text: "\n\nCompacting completed." },
                     },
                   });
+                  compactionMessageId = undefined;
                 } else if (message.compact_result === "failed" && compactionInProgress) {
                   compactionInProgress = false;
                   const reason = message.compact_error ? `: ${message.compact_error}` : ".";
@@ -1339,9 +1351,13 @@ export class ClaudeAcpAgent {
                     sessionId: message.session_id,
                     update: {
                       sessionUpdate: "agent_message_chunk",
+                      messageId:
+                        compactionMessageId ??
+                        syntheticMessageId(message.session_id, "compaction", randomUUID()),
                       content: { type: "text", text: `\n\nCompacting failed${reason}` },
                     },
                   });
+                  compactionMessageId = undefined;
                 }
                 break;
               }
@@ -1385,6 +1401,11 @@ export class ClaudeAcpAgent {
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "agent_message_chunk",
+                    messageId: syntheticMessageId(
+                      message.session_id,
+                      "local-command",
+                      randomUUID(),
+                    ),
                     content: { type: "text", text: message.content },
                   },
                 });
@@ -1527,6 +1548,11 @@ export class ClaudeAcpAgent {
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "agent_message_chunk",
+                    messageId: syntheticMessageId(
+                      message.session_id,
+                      "informational",
+                      randomUUID(),
+                    ),
                     content: { type: "text", text },
                   },
                 });
@@ -1653,6 +1679,7 @@ export class ClaudeAcpAgent {
                   sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "agent_message_chunk",
+                    messageId: syntheticMessageId(params.sessionId, "refusal", randomUUID()),
                     content: { type: "text", text: lastRefusalExplanation },
                   },
                 });
@@ -4099,10 +4126,13 @@ export function messageIdForGrouping(message: {
   return typeof message.uuid === "string" && message.uuid.length > 0 ? message.uuid : undefined;
 }
 
+function syntheticMessageId(sessionId: string, kind: string, id: string): string {
+  return `claude:${sessionId}:${kind}:${id}`;
+}
+
 /**
  * Stamps an ACP `messageId` onto a session update, but only on the message/
  * thought chunk variants that carry one — tool_call/plan/etc. updates never do.
- * No-op when `messageId` is falsy, so callers can pass it through unconditionally.
  */
 function applyMessageId(
   update: SessionNotification["update"],
@@ -4146,6 +4176,7 @@ export function toAcpNotifications(
   const taskState = options?.taskState ?? new Map();
   const registerHooks = options?.registerHooks !== false;
   const supportsTerminalOutput = options?.clientCapabilities?._meta?.["terminal_output"] === true;
+  const chunkMessageId = options?.messageId ?? syntheticMessageId(sessionId, role, randomUUID());
   if (typeof content === "string") {
     const update: SessionNotification["update"] = {
       sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
@@ -4154,7 +4185,7 @@ export function toAcpNotifications(
         text: content,
       },
     };
-    applyMessageId(update, options?.messageId);
+    applyMessageId(update, chunkMessageId);
 
     if (options?.parentToolUseId) {
       update._meta = {
@@ -4441,7 +4472,7 @@ export function toAcpNotifications(
           },
         };
       }
-      applyMessageId(update, options?.messageId);
+      applyMessageId(update, chunkMessageId);
       output.push({ sessionId, update });
     }
   }
