@@ -1337,9 +1337,7 @@ export class ClaudeAcpAgent {
                     sessionId: message.session_id,
                     update: {
                       sessionUpdate: "agent_message_chunk",
-                      messageId:
-                        compactionMessageId ??
-                        syntheticMessageId(message.session_id, "compaction", randomUUID()),
+                      messageId: requireMessageId(compactionMessageId, "compaction"),
                       content: { type: "text", text: "\n\nCompacting completed." },
                     },
                   });
@@ -1351,9 +1349,7 @@ export class ClaudeAcpAgent {
                     sessionId: message.session_id,
                     update: {
                       sessionUpdate: "agent_message_chunk",
-                      messageId:
-                        compactionMessageId ??
-                        syntheticMessageId(message.session_id, "compaction", randomUUID()),
+                      messageId: requireMessageId(compactionMessageId, "compaction"),
                       content: { type: "text", text: `\n\nCompacting failed${reason}` },
                     },
                   });
@@ -1719,6 +1715,13 @@ export class ClaudeAcpAgent {
                     session.toolUseCache,
                     this.client,
                     this.logger,
+                    {
+                      messageId: syntheticMessageId(
+                        params.sessionId,
+                        "local-command-result",
+                        randomUUID(),
+                      ),
+                    },
                   )) {
                     await this.client.sessionUpdate(notification);
                   }
@@ -1783,7 +1786,10 @@ export class ClaudeAcpAgent {
             // so the streamed chunks that follow (whose delta events don't carry
             // it) can all be tagged with the same, replay-stable id.
             if (message.event.type === "message_start") {
-              currentStreamMessageId = message.event.message.id || undefined;
+              currentStreamMessageId = requireMessageId(
+                message.event.message.id || undefined,
+                "Claude stream message_start",
+              );
               // A new top-level message starts: clear any streamed-content
               // residue from a prior message that never reached its
               // consolidated reset — a cancelled turn breaks out before the
@@ -4134,17 +4140,25 @@ function syntheticMessageId(sessionId: string, kind: string, id: string): string
  * Stamps an ACP `messageId` onto a session update, but only on the message/
  * thought chunk variants that carry one — tool_call/plan/etc. updates never do.
  */
+function requireMessageId(messageId: string | undefined, context: string): string {
+  if (!messageId) {
+    throw new Error(`${context} messageId is required`);
+  }
+  return messageId;
+}
+
 function applyMessageId(
   update: SessionNotification["update"],
   messageId: string | undefined,
 ): void {
-  if (
-    messageId &&
-    (update.sessionUpdate === "agent_message_chunk" ||
-      update.sessionUpdate === "user_message_chunk" ||
-      update.sessionUpdate === "agent_thought_chunk")
-  ) {
-    update.messageId = messageId;
+  switch (update.sessionUpdate) {
+    case "agent_message_chunk":
+    case "user_message_chunk":
+    case "agent_thought_chunk":
+      update.messageId = requireMessageId(messageId, update.sessionUpdate);
+      break;
+    default:
+      break;
   }
 }
 
@@ -4165,18 +4179,16 @@ export function toAcpNotifications(
     parentToolUseId?: string | null;
     cwd?: string;
     taskState?: TaskState;
-    // Opaque id identifying the message these chunks belong to (ACP message ids
-    // are opaque strings — no particular format is required). Attached to
-    // user/agent message and thought chunks so clients can group streamed chunks
-    // into a single message. Omit it (leave undefined) when unknown — never send
-    // an explicit `null`.
+    // Opaque id identifying the message these chunks belong to. Required when
+    // this conversion emits user/agent message or thought chunks; ignored by
+    // tool/plan-only conversions.
     messageId?: string;
   },
 ): SessionNotification[] {
   const taskState = options?.taskState ?? new Map();
   const registerHooks = options?.registerHooks !== false;
   const supportsTerminalOutput = options?.clientCapabilities?._meta?.["terminal_output"] === true;
-  const chunkMessageId = options?.messageId ?? syntheticMessageId(sessionId, role, randomUUID());
+  const chunkMessageId = options?.messageId;
   if (typeof content === "string") {
     const update: SessionNotification["update"] = {
       sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
