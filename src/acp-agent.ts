@@ -1709,6 +1709,8 @@ export class ClaudeAcpAgent {
               case "notification":
               case "api_retry":
               case "thinking_tokens":
+              case "control_request_progress":
+              case "background_tasks_changed":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               case "model_refusal_fallback": {
@@ -2381,13 +2383,10 @@ export class ClaudeAcpAgent {
           // `conversation_reset` (from `/clear`, plan-mode exit, fresh-session
           // flows) is safe to drop: turn lifecycle here is driven by
           // results/idle, and the client owns its own transcript view.
-          // `control_request_progress` only reports on side_question control
-          // requests, which this adapter never issues.
           case "tool_use_summary":
           case "auth_status":
           case "prompt_suggestion":
           case "conversation_reset":
-          case "control_request_progress":
             break;
           default:
             unreachable(message);

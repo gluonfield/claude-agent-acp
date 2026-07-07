@@ -211,7 +211,8 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       }
       // Accept the first option of every choice field (skip the free-text one).
       const content: Record<string, string | string[]> = {};
-      for (const [key, prop] of Object.entries(params.requestedSchema.properties ?? {})) {
+      const schema = params.requestedSchema as { properties?: Record<string, unknown> };
+      for (const [key, prop] of Object.entries(schema.properties ?? {})) {
         if (key === "customAnswer") continue;
         const p = prop as {
           oneOf?: Array<{ const: string }>;
@@ -439,7 +440,10 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     // mechanism.
     const properties =
       elicitation.mode === "form" && "requestedSchema" in elicitation
-        ? Object.keys(elicitation.requestedSchema.properties ?? {})
+        ? Object.keys(
+            (elicitation.requestedSchema as { properties?: Record<string, unknown> }).properties ??
+              {},
+          )
         : [];
     expect(properties).toContain("question_0");
     expect(properties).toContain("question_0_custom");
