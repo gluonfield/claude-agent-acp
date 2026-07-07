@@ -578,6 +578,9 @@ export function isLocalCommandMetadata(content: unknown): boolean {
 const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   auto: "auto",
   default: "default",
+  // Claude Code 2.1.200 renamed the "default" mode to "Manual" and accepts
+  // `"defaultMode": "manual"` in settings.json; honor the same alias here.
+  manual: "default",
   acceptedits: "acceptEdits",
   dontask: "dontAsk",
   plan: "plan",
@@ -1138,7 +1141,6 @@ export class ClaudeAcpAgent {
     // compaction, and the two messages are indistinguishable — so we report the
     // outcome only while a compaction is in progress, then clear this.
     let compactionInProgress = false;
-    let compactionMessageId: string | undefined;
     // Anthropic API message id of the assistant message currently being
     // streamed, captured from `message_start` so the streamed chunks that follow
     // (whose delta events don't carry it) can all be tagged with the same,
@@ -1180,7 +1182,6 @@ export class ClaudeAcpAgent {
       lastAssistantError = undefined;
       lastRefusalExplanation = null;
       compactionInProgress = false;
-      compactionMessageId = undefined;
       // Do NOT reset currentStreamMessageId or streamedBlocks here. Turn
       // activation can fire mid-message (the replayed user echo with
       // --replay-user-messages lands between a message's blocks); clearing the
@@ -1414,16 +1415,10 @@ export class ClaudeAcpAgent {
               case "status": {
                 if (message.status === "compacting") {
                   compactionInProgress = true;
-                  compactionMessageId = syntheticMessageId(
-                    message.session_id,
-                    "compaction",
-                    randomUUID(),
-                  );
                   await this.client.sessionUpdate({
                     sessionId: message.session_id,
                     update: {
                       sessionUpdate: "agent_message_chunk",
-                      messageId: compactionMessageId,
                       content: { type: "text", text: "Compacting..." },
                     },
                   });
@@ -1436,11 +1431,9 @@ export class ClaudeAcpAgent {
                     sessionId: message.session_id,
                     update: {
                       sessionUpdate: "agent_message_chunk",
-                      messageId: requireMessageId(compactionMessageId, "compaction"),
                       content: { type: "text", text: "\n\nCompacting completed." },
                     },
                   });
-                  compactionMessageId = undefined;
                 } else if (message.compact_result === "failed" && compactionInProgress) {
                   compactionInProgress = false;
                   const reason = message.compact_error ? `: ${message.compact_error}` : ".";
@@ -1448,11 +1441,9 @@ export class ClaudeAcpAgent {
                     sessionId: message.session_id,
                     update: {
                       sessionUpdate: "agent_message_chunk",
-                      messageId: requireMessageId(compactionMessageId, "compaction"),
                       content: { type: "text", text: `\n\nCompacting failed${reason}` },
                     },
                   });
-                  compactionMessageId = undefined;
                 }
                 break;
               }
@@ -1496,11 +1487,6 @@ export class ClaudeAcpAgent {
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "agent_message_chunk",
-                    messageId: syntheticMessageId(
-                      message.session_id,
-                      "local-command",
-                      randomUUID(),
-                    ),
                     content: { type: "text", text: message.content },
                   },
                 });
@@ -1685,11 +1671,6 @@ export class ClaudeAcpAgent {
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "agent_message_chunk",
-                    messageId: syntheticMessageId(
-                      message.session_id,
-                      "informational",
-                      randomUUID(),
-                    ),
                     content: { type: "text", text },
                   },
                 });
@@ -1901,7 +1882,6 @@ export class ClaudeAcpAgent {
                   sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "agent_message_chunk",
-                    messageId: syntheticMessageId(params.sessionId, "refusal", randomUUID()),
                     content: { type: "text", text: lastRefusalExplanation },
                   },
                 });
@@ -1941,13 +1921,6 @@ export class ClaudeAcpAgent {
                     session.toolUseCache,
                     this.client,
                     this.logger,
-                    {
-                      messageId: syntheticMessageId(
-                        params.sessionId,
-                        "local-command-result",
-                        randomUUID(),
-                      ),
-                    },
                   )) {
                     await this.client.sessionUpdate(notification);
                   }
@@ -2012,10 +1985,7 @@ export class ClaudeAcpAgent {
             // so the streamed chunks that follow (whose delta events don't carry
             // it) can all be tagged with the same, replay-stable id.
             if (message.event.type === "message_start") {
-              currentStreamMessageId = requireMessageId(
-                message.event.message.id || undefined,
-                "Claude stream message_start",
-              );
+              currentStreamMessageId = message.event.message.id || undefined;
               // A new top-level message starts: clear any streamed-content
               // residue from a prior message that never reached its
               // consolidated reset — a cancelled turn breaks out before the
@@ -4080,8 +4050,10 @@ function buildAvailableModes(modelInfo: ModelInfo | undefined): SessionModeState
 
   modes.push(
     {
+      // Claude Code 2.1.200 renamed this mode to "Manual" across its surfaces;
+      // the wire id stays "default" ("manual" is only an accepted input alias).
       id: "default",
-      name: "Default",
+      name: "Manual",
       description: "Standard behavior, prompts for dangerous operations",
     },
     {
@@ -4772,33 +4744,22 @@ export function messageIdForGrouping(message: {
   return typeof message.uuid === "string" && message.uuid.length > 0 ? message.uuid : undefined;
 }
 
-function syntheticMessageId(sessionId: string, kind: string, id: string): string {
-  return `claude:${sessionId}:${kind}:${id}`;
-}
-
 /**
  * Stamps an ACP `messageId` onto a session update, but only on the message/
  * thought chunk variants that carry one — tool_call/plan/etc. updates never do.
+ * No-op when `messageId` is falsy, so callers can pass it through unconditionally.
  */
-function requireMessageId(messageId: string | undefined, context: string): string {
-  if (!messageId) {
-    throw new Error(`${context} messageId is required`);
-  }
-  return messageId;
-}
-
 function applyMessageId(
   update: SessionNotification["update"],
   messageId: string | undefined,
 ): void {
-  switch (update.sessionUpdate) {
-    case "agent_message_chunk":
-    case "user_message_chunk":
-    case "agent_thought_chunk":
-      update.messageId = requireMessageId(messageId, update.sessionUpdate);
-      break;
-    default:
-      break;
+  if (
+    messageId &&
+    (update.sessionUpdate === "agent_message_chunk" ||
+      update.sessionUpdate === "user_message_chunk" ||
+      update.sessionUpdate === "agent_thought_chunk")
+  ) {
+    update.messageId = messageId;
   }
 }
 
@@ -4884,17 +4845,21 @@ export function toAcpNotifications(
     // tool_call/update decision falls back to `toolUseCache` presence (the
     // historical single-source behavior).
     emittedToolCalls?: Set<string>;
-    // Opaque id identifying the message these chunks belong to. Required when
-    // this conversion emits user/agent message or thought chunks; ignored by
-    // tool/plan-only conversions.
+    // Opaque id identifying the message these chunks belong to (ACP message ids
+    // are opaque strings — no particular format is required). Attached to
+    // user/agent message and thought chunks so clients can group streamed chunks
+    // into a single message. Omit it (leave undefined) when unknown — never send
+    // an explicit `null`.
     messageId?: string;
   },
 ): SessionNotification[] {
   const taskState = options?.taskState ?? new Map();
   const registerHooks = options?.registerHooks !== false;
   const supportsTerminalOutput = options?.clientCapabilities?._meta?.["terminal_output"] === true;
-  const chunkMessageId = options?.messageId;
   if (typeof content === "string") {
+    if (content.length === 0) {
+      return [];
+    }
     const update: SessionNotification["update"] = {
       sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
       content: {
@@ -4902,7 +4867,7 @@ export function toAcpNotifications(
         text: content,
       },
     };
-    applyMessageId(update, chunkMessageId);
+    applyMessageId(update, options?.messageId);
 
     if (options?.parentToolUseId) {
       update._meta = {
@@ -4924,13 +4889,15 @@ export function toAcpNotifications(
     switch (chunk.type) {
       case "text":
       case "text_delta":
-        update = {
-          sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
-          content: {
-            type: "text",
-            text: chunk.text,
-          },
-        };
+        if (chunk.text.length > 0) {
+          update = {
+            sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
+            content: {
+              type: "text",
+              text: chunk.text,
+            },
+          };
+        }
         break;
       case "image":
         update = {
@@ -5172,7 +5139,7 @@ export function toAcpNotifications(
           },
         };
       }
-      applyMessageId(update, chunkMessageId);
+      applyMessageId(update, options?.messageId);
       output.push({ sessionId, update });
     }
   }

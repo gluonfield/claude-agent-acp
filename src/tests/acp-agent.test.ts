@@ -204,7 +204,9 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       params: CreateElicitationRequest,
     ): Promise<CreateElicitationResponse> {
       this.elicitations.push(params);
-      if (params.mode !== "form") {
+      // The `in` check also excludes the custom/future-mode variant, whose
+      // `mode: string` would otherwise survive the literal comparison.
+      if (params.mode !== "form" || !("requestedSchema" in params)) {
         return { action: "decline" };
       }
       // Accept the first option of every choice field (skip the free-text one).
@@ -436,7 +438,9 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     // which confirms our interception path produced it rather than some other
     // mechanism.
     const properties =
-      elicitation.mode === "form" ? Object.keys(elicitation.requestedSchema.properties ?? {}) : [];
+      elicitation.mode === "form" && "requestedSchema" in elicitation
+        ? Object.keys(elicitation.requestedSchema.properties ?? {})
+        : [];
     expect(properties).toContain("question_0");
     expect(properties).toContain("question_0_custom");
 
@@ -3528,7 +3532,7 @@ describe("usage_update computation", () => {
       session_id: "test-session",
       event:
         eventType === "message_start"
-          ? { type: "message_start" as const, message: { id: randomUUID(), ...payload } }
+          ? { type: "message_start" as const, message: payload }
           : { type: "message_delta" as const, ...payload },
     };
   }
@@ -4466,36 +4470,6 @@ describe("usage_update computation", () => {
     expect(usageUpdate.update.used).toBe(0);
     expect(usageUpdate.update.size).toBe(200000);
     expect(session.contextWindowSize).toBe(200000);
-  });
-
-  it("tags synthetic compaction chunks with one messageId", async () => {
-    const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
-      {
-        type: "system",
-        subtype: "status",
-        session_id: "test-session",
-        status: "compacting",
-      },
-      {
-        type: "system",
-        subtype: "status",
-        session_id: "test-session",
-        compact_result: "success",
-      },
-      createResultMessageWithModel({ modelUsage: {} }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
-    ]);
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
-
-    const chunks = updates.filter((u: any) => u.update?.sessionUpdate === "agent_message_chunk");
-    expect(chunks.map((u: any) => u.update.content.text)).toEqual([
-      "Compacting...",
-      "\n\nCompacting completed.",
-    ]);
-    expect(chunks[0].update.messageId).toMatch(/^claude:test-session:compaction:/);
-    expect(chunks[1].update.messageId).toBe(chunks[0].update.messageId);
   });
 });
 
@@ -6662,10 +6636,9 @@ describe("toAcpNotifications messageId", () => {
     });
   });
 
-  it("rejects message chunks without messageId", () => {
-    expect(() =>
-      toAcpNotifications("hello", "assistant", "test", {}, {} as AcpClient, console),
-    ).toThrow("agent_message_chunk messageId is required");
+  it("omits messageId when none is supplied", () => {
+    const result = toAcpNotifications("hello", "assistant", "test", {}, {} as AcpClient, console);
+    expect(result[0].update).not.toHaveProperty("messageId");
   });
 
   it("never sets messageId on non-chunk updates (tool_call)", () => {
@@ -6699,7 +6672,6 @@ describe("toAcpNotifications thinking chunks", () => {
       {},
       {} as AcpClient,
       console,
-      { messageId: "message-1" },
     );
 
     expect(result).toEqual([
@@ -6707,7 +6679,6 @@ describe("toAcpNotifications thinking chunks", () => {
         sessionId: "test",
         update: {
           sessionUpdate: "agent_thought_chunk",
-          messageId: "message-1",
           content: { type: "text", text: "let me reason" },
         },
       },
