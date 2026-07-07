@@ -4782,6 +4782,19 @@ function shouldEmitToolCall(toolName: string): boolean {
   return toolName !== "TodoWrite" && !isTaskTool(toolName);
 }
 
+function toolCallInputReady(rawInput: unknown): boolean {
+  if (rawInput === undefined || rawInput === null) {
+    return false;
+  }
+  if (Array.isArray(rawInput)) {
+    return rawInput.length > 0;
+  }
+  if (typeof rawInput === "object") {
+    return Object.keys(rawInput).length > 0;
+  }
+  return true;
+}
+
 /** Build the `tool_call` (or, with `refine`, the `tool_call_update`)
  *  notification for a tool_use. Shared by every site that surfaces a tool call:
  *  the streamed tool_use path (first encounter → tool_call, later encounter →
@@ -4989,31 +5002,35 @@ export function toAcpNotifications(
             // ignore if we can't turn it to JSON
           }
 
-          // Emit a `tool_call` only the first time this id surfaces to the
-          // client; afterwards refine it with a `tool_call_update`. The first
-          // surface may be this stream chunk OR an earlier permission request
-          // (see `ensureToolCallEmitted`), so emission is tracked separately
-          // from `toolUseCache`. Without an `emittedToolCalls` set we fall back
-          // to cache presence — the historical streaming-only behavior.
-          const emittedToolCalls = options?.emittedToolCalls;
-          const alreadyEmitted = emittedToolCalls ? emittedToolCalls.has(chunk.id) : alreadyCached;
-          emittedToolCalls?.add(chunk.id);
+          if (toolCallInputReady(rawInput)) {
+            // Emit a `tool_call` only the first time this id surfaces to the
+            // client; afterwards refine it with a `tool_call_update`. The first
+            // surface may be this stream chunk OR an earlier permission request
+            // (see `ensureToolCallEmitted`), so emission is tracked separately
+            // from `toolUseCache`. Without an `emittedToolCalls` set we fall back
+            // to cache presence — the historical streaming-only behavior.
+            const emittedToolCalls = options?.emittedToolCalls;
+            const alreadyEmitted = emittedToolCalls
+              ? emittedToolCalls.has(chunk.id)
+              : alreadyCached;
+            emittedToolCalls?.add(chunk.id);
 
-          if (alreadyEmitted) {
-            // Already surfaced (full assistant message after streaming, or a
-            // permission request emitted it first) — refine with a
-            // tool_call_update rather than emitting a duplicate tool_call.
-            update = toolCallNotification(
-              chunk,
-              rawInput,
-              supportsTerminalOutput,
-              options?.cwd,
-              true,
-            );
-          } else {
-            // First surface (streaming content_block_start or replay) — send as
-            // tool_call (with terminal_info for Bash).
-            update = toolCallNotification(chunk, rawInput, supportsTerminalOutput, options?.cwd);
+            if (alreadyEmitted) {
+              // Already surfaced (full assistant message after streaming, or a
+              // permission request emitted it first) — refine with a
+              // tool_call_update rather than emitting a duplicate tool_call.
+              update = toolCallNotification(
+                chunk,
+                rawInput,
+                supportsTerminalOutput,
+                options?.cwd,
+                true,
+              );
+            } else {
+              // First surface (streaming content_block_start or replay) — send as
+              // tool_call (with terminal_info for Bash).
+              update = toolCallNotification(chunk, rawInput, supportsTerminalOutput, options?.cwd);
+            }
           }
         }
         break;

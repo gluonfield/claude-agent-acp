@@ -1964,6 +1964,43 @@ describe("tool_call emitted before permission request", () => {
     expect(notifications[0].update.sessionUpdate).toBe("tool_call_update");
   });
 
+  it("waits for streamed tool input before emitting the tool_call", () => {
+    const { session } = setup();
+
+    const placeholder = toAcpNotifications(
+      [{ type: "tool_use", id: "tool-1", name: "Bash", input: {} }],
+      "assistant",
+      "session-1",
+      session.toolUseCache,
+      {} as AcpClient,
+      console,
+      { emittedToolCalls: session.emittedToolCalls },
+    );
+
+    expect(placeholder).toEqual([]);
+    expect(session.emittedToolCalls.has("tool-1")).toBe(false);
+    expect(session.toolUseCache["tool-1"]).toMatchObject({ name: "Bash", input: {} });
+
+    const ready = toAcpNotifications(
+      [{ type: "tool_use", id: "tool-1", name: "Bash", input: { command: "ls" } }],
+      "assistant",
+      "session-1",
+      session.toolUseCache,
+      {} as AcpClient,
+      console,
+      { emittedToolCalls: session.emittedToolCalls },
+    );
+
+    expect(ready).toHaveLength(1);
+    expect(ready[0].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "tool-1",
+      title: "ls",
+      rawInput: { command: "ls" },
+    });
+    expect(session.emittedToolCalls.has("tool-1")).toBe(true);
+  });
+
   it("does not emit a tool_call for suppressed tools (TodoWrite) on a permission request", async () => {
     const { agent, events, session } = setup();
 
