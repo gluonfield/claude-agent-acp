@@ -60,6 +60,7 @@ import {
   CanUseTool,
   deleteSession,
   EffortLevel,
+  FastModeDisabledReason,
   FastModeState,
   getSessionInfo,
   getSessionMessages,
@@ -213,6 +214,15 @@ const STEER_METHOD = "_session/steering";
  *  steering always uses `now` so the running turn adapts as soon as possible. */
 const STEER_PRIORITY = "now" as const;
 
+/** Request-level steering options. `promptRequired` is opt-in so existing Hosts
+ *  keep the established idle fallback behavior. */
+type SteerMeta = {
+  [key: string]: unknown;
+  steering?: {
+    idleBehavior?: "promptRequired";
+  };
+};
+
 /** Params of a {@link STEER_METHOD} request. Shaped like the relevant subset of
  *  a `PromptRequest` so the same `promptToClaude` conversion applies. Delivery
  *  priority is deliberately NOT exposed here — it's an internal detail the agent
@@ -220,23 +230,16 @@ const STEER_PRIORITY = "now" as const;
 export type SteerRequest = {
   sessionId: string;
   prompt: PromptRequest["prompt"];
+  _meta?: SteerMeta | null;
 };
 
-/** Where a steering message was accepted, per the wire protocol's two
- *  successful outcomes:
- *   - `injected`: a turn was still running and the message was applied to it;
- *   - `startedNewTurn`: the turn we meant to steer had already finished (an
- *     unavoidable race), so the message began a fresh turn instead of being
- *     dropped.
- *  Both are success results — never a JSON-RPC error — and tell the client
- *  where the message landed. */
-type SteerOutcome = "injected" | "startedNewTurn";
-
-/** Result of a {@link STEER_METHOD} request: the single required `outcome`
- *  field the client reads to learn where its steering message was accepted. */
-export type SteerResponse = {
-  outcome: SteerOutcome;
-};
+/** Result of a {@link STEER_METHOD} request. The legacy `startedNewTurn` result
+ *  remains the default idle behavior; `promptRequired` is returned only when the
+ *  Host explicitly opts into the host-owned fallback in request `_meta`. */
+export type SteerResponse =
+  | { outcome: "injected" }
+  | { outcome: "startedNewTurn" }
+  | { outcome: "promptRequired"; reason: "noRunningTurn" };
 
 /** Validate raw JSON-RPC params into a {@link SteerRequest}. Kept minimal — the
  *  content blocks are handed to `promptToClaude`, which tolerates unknown block
@@ -245,16 +248,26 @@ function parseSteerRequest(params: unknown): SteerRequest {
   if (!params || typeof params !== "object") {
     throw RequestError.invalidParams(undefined, "steer params must be an object");
   }
-  const { sessionId, prompt } = params as Record<string, unknown>;
+  const { sessionId, prompt, _meta } = params as Record<string, unknown>;
   if (typeof sessionId !== "string" || sessionId.length === 0) {
     throw RequestError.invalidParams(undefined, "steer params require a non-empty sessionId");
   }
   if (!Array.isArray(prompt) || prompt.length === 0) {
     throw RequestError.invalidParams(undefined, "steer params require a non-empty prompt array");
   }
+  const steering =
+    _meta && typeof _meta === "object" ? (_meta as Record<string, unknown>).steering : undefined;
+  const idleBehavior =
+    steering && typeof steering === "object"
+      ? (steering as Record<string, unknown>).idleBehavior
+      : undefined;
+  if (idleBehavior !== undefined && idleBehavior !== "promptRequired") {
+    throw RequestError.invalidParams(undefined, "unsupported steering idleBehavior");
+  }
   return {
     sessionId,
     prompt: prompt as PromptRequest["prompt"],
+    _meta: _meta as SteerMeta | null | undefined,
   };
 }
 
@@ -444,6 +457,13 @@ type Session = {
    *  user's intent so it persists across model switches; the Fast mode config
    *  option is only surfaced while the selected model supports it. */
   fastModeEnabled: boolean;
+  /** Why the SDK currently can't serve Fast mode, when the reason is one worth
+   *  telling the user about (see {@link FAST_MODE_UNAVAILABLE_EXPLANATIONS} —
+   *  routine states like the SDK's own opt-in requirement normalize to
+   *  `undefined`). Refreshed from every `fast_mode_disabled_reason` the SDK
+   *  reports on `system`/init and user-turn `result`s; surfaced in the Fast mode
+   *  option's description so a toggle that snaps back off explains itself. */
+  fastModeDisabledReason?: FastModeDisabledReason;
   abortController: AbortController;
   /** Signal the consumer races `query.next()` against. Aborted by cancel()
    *  (after a grace period) to force the active turn to settle "cancelled" when
@@ -457,6 +477,9 @@ type Session = {
    *  cancel. */
   forceCancelTimer?: ReturnType<typeof setTimeout>;
   emitRawSDKMessages: boolean | SDKMessageFilter[];
+  /** Whether nested subagent text/thinking is forwarded to the ACP client.
+   *  Enabled by either the ACP capability or the pre-existing SDK option. */
+  forwardSubagentText: boolean;
   /** Context window size of the session's current model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Seeded synchronously at
@@ -804,6 +827,8 @@ export type ToolUpdateMeta = {
   claudeCode?: {
     /* The name of the tool that was used in Claude Code. */
     toolName: string;
+    /* A human-readable title supplied by Claude Code for the tool call. */
+    title?: string;
     /* The structured output provided by Claude Code. */
     toolResponse?: unknown;
     /* For a tool call made inside a subagent: the tool_use id of the
@@ -819,6 +844,11 @@ export type ToolUpdateMeta = {
     /* Free-text the user supplied when rejecting the tool call, when the
        harness collected any. Only ever present alongside nonExecutionKind. */
     userFeedback?: string;
+    /* Marks Agent/Task tool calls as subagent launches. ACP 1.2 has no
+       standard subagent ToolKind yet, so clients that support nested
+       transcripts need a namespaced marker instead of inferring from
+       `toolName` or the generic `think` kind. */
+    subagent?: true;
   };
   /* Terminal metadata for Bash tool execution, matching codex-acp's _meta protocol. */
   terminal_info?: {
@@ -834,6 +864,28 @@ export type ToolUpdateMeta = {
     signal: string | null;
   };
 };
+
+const SUBAGENT_TRANSCRIPT_CAPABILITY = "subagent-transcript";
+
+function supportsSubagentTranscript(capabilities?: ClientCapabilities | null): boolean {
+  return capabilities?._meta?.[SUBAGENT_TRANSCRIPT_CAPABILITY] === true;
+}
+
+function parentToolUseIdOf(message: { parent_tool_use_id?: unknown }): string | null {
+  if (!("parent_tool_use_id" in message)) return null;
+  return typeof message.parent_tool_use_id === "string" ? message.parent_tool_use_id : null;
+}
+
+function stripSubagentTextAndThinking(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+  return content.filter(
+    (item) =>
+      !item ||
+      typeof item !== "object" ||
+      !("type" in item) ||
+      (item.type !== "text" && item.type !== "thinking"),
+  );
+}
 
 export type ToolUseCache = {
   [key: string]: {
@@ -1443,10 +1495,9 @@ export class ClaudeAcpAgent {
         ...terminalAuthMethods,
         ...(supportsGatewayAuth ? [gatewayAuthMethod, gatewayBedrockAuthMethod] : []),
       ],
-      // Top-level `_meta` (sibling of `agentCapabilities`), per the ACP steering
-      // wire protocol: advertises the `_session/steering` extension request so
-      // clients know they may inject a follow-up into the running turn (see
-      // STEER_METHOD) instead of queuing it as a separate `session/prompt`.
+      // Top-level `_meta` (sibling of `agentCapabilities`), per the existing ACP
+      // steering extension contract: advertises the `_session/steering` request
+      // so clients know they may inject a follow-up into a running turn.
       _meta: {
         steering: {
           supported: true,
@@ -1749,11 +1800,10 @@ export class ClaudeAcpAgent {
     return response;
   }
 
-  /** Steer the session per the ACP steering wire protocol: apply a follow-up
-   *  message to the turn that is currently running, or — if that turn already
-   *  finished — start a fresh turn with it. Never drops the message and never
-   *  returns a JSON-RPC error for the "arrived too late" race; both paths are
-   *  success outcomes (see {@link SteerOutcome}).
+  /** Steer the session per the ACP steering wire protocol: inject a follow-up
+   *  message into the turn that is currently running. If that turn already
+   *  settled, the established default starts a new detached turn; Hosts may opt
+   *  into the host-owned `promptRequired` fallback through request `_meta`.
    *
    *  When a turn is in flight this injects (returns `injected`): unlike
    *  `prompt()`, it does NOT create a Turn or enqueue on `turnQueue`; it pushes
@@ -1766,16 +1816,13 @@ export class ClaudeAcpAgent {
    *  calls). The steered message's own output streams via `session/update`, not
    *  this response.
    *
-   *  When the session is idle (no unsettled turn — the turn we meant to steer
-   *  raced ahead and finished), this starts a normal new turn with the message
-   *  and returns `startedNewTurn`. That turn is fire-and-forget from the steer
-   *  request's view: its `PromptResponse` and output flow through the usual
-   *  `prompt()`/`session/update` path, so we return the outcome immediately
-   *  rather than awaiting turn completion. */
+   *  When the session is idle, the opt-in path returns `promptRequired` WITHOUT
+   *  calling `prompt()`, pushing SDK input, or mutating `turnQueue`: the content
+   *  stays Host-owned so the Host can submit it through a standard
+   *  `session/prompt`. Without the opt-in, the existing detached `prompt()` and
+   *  `startedNewTurn` result are preserved for compatibility. */
   async steer(params: SteerRequest): Promise<SteerResponse> {
     const sessionId = params.sessionId;
-    const prompt = params.prompt;
-
     const session = this.sessions[sessionId];
     if (!session) {
       throw new Error("Session not found");
@@ -1783,28 +1830,36 @@ export class ClaudeAcpAgent {
     if (session.queryClosed) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
+
     // "A turn is running" = the queue holds an unsettled turn. This covers both
     // the activated turn and one just submitted but not yet echoed/activated,
-    // which is exactly the window in which steering is meaningful.
-    const turnInFlight = (session.turnQueue ?? []).some((t) => !t.settled);
-    const promptRequest: PromptRequest = {
-      sessionId: sessionId,
-      prompt: prompt,
-    };
-
+    // which is exactly the window in which steering is meaningful. This check
+    // and the active-path push below stay in one synchronous section so the
+    // turn cannot settle in the gap between deciding to inject and enqueueing.
+    const turnInFlight = (session.turnQueue ?? []).some((turn) => !turn.settled);
     if (!turnInFlight) {
-      // Race: the turn we meant to steer already finished. Per the protocol the
-      // message must not be dropped nor surfaced as an error — start a fresh
-      // turn with it. Don't await: the new turn streams via session/update and
-      // its PromptResponse is consumed by the normal prompt() path; we only owe
-      // the client the outcome. `.catch` keeps the detached promise from
-      // becoming an unhandled rejection.
+      const promptRequest: PromptRequest = {
+        sessionId,
+        prompt: params.prompt,
+      };
+      if (params._meta?.steering?.idleBehavior === "promptRequired") {
+        // The opt-in path leaves the content untouched so the Host can retry via
+        // a normal session/prompt whose lifecycle owns the continuation result.
+        return { outcome: "promptRequired", reason: "noRunningTurn" };
+      }
+
+      // Preserve the established default for Hosts that do not opt in. This is
+      // intentionally detached for compatibility with the existing contract.
       this.prompt(promptRequest).catch((error) => {
         this.logger.error(`Session ${sessionId}: steered new turn failed: ${error}`);
       });
       return { outcome: "startedNewTurn" };
     }
 
+    const promptRequest: PromptRequest = {
+      sessionId,
+      prompt: params.prompt,
+    };
     const userMessage = promptToClaude(promptRequest);
     userMessage.uuid = randomUUID();
     // Deliver into the running turn rather than queuing behind it as a fresh
@@ -2477,7 +2532,12 @@ export class ClaudeAcpAgent {
                 // A fresh `system`/init (e.g. after reinitialize) can carry an
                 // updated Fast mode state; reconcile it with what we seeded at
                 // session creation.
-                await this.syncFastModeState(message.session_id, session, message.fast_mode_state);
+                await this.syncFastModeState(
+                  message.session_id,
+                  session,
+                  message.fast_mode_state,
+                  message.fast_mode_disabled_reason,
+                );
                 break;
               }
               case "status": {
@@ -2732,6 +2792,28 @@ export class ClaudeAcpAgent {
                 // already emitted as a `tool_call`, so mark it failed with the
                 // rejection reason — otherwise the client shows a tool call
                 // that silently never resolves.
+                //
+                // The id is the executing call's own, and the frame lands
+                // between its `tool_use` and its `tool_result` (the SDK enqueues
+                // it from inside canUseTool), so the call is normally in flight
+                // here. Not always: the assistant message carrying the tool_use
+                // is dropped by the cancelled-turn guard below, and a denial for
+                // it can still arrive afterwards — the case the `tool_result`
+                // fallback in `toAcpNotifications` gates on `wasEmitted` for.
+                // Drop the update rather than reference a tool call the client
+                // was never given (see `ensureToolCallEmitted`, issue #851).
+                if (!session.emittedToolCalls.has(message.tool_use_id)) {
+                  break;
+                }
+                // A denial inside a subagent identifies the subagent by
+                // `agent_id` (as canUseTool does with `agentID`), never by the
+                // Agent/Task call that spawned it. Resolve it the same way so
+                // the update lands in the subagent's transcript alongside the
+                // `tool_call` it resolves, which carries the parent stamped from
+                // `parent_tool_use_id` (see `liveBackgroundTasks`).
+                const parentToolUseId = message.agent_id
+                  ? session.liveBackgroundTasks.get(message.agent_id)?.parentToolUseId
+                  : undefined;
                 const reason = message.decision_reason ?? message.message;
                 await sendUpdate({
                   sessionId: message.session_id,
@@ -2748,6 +2830,7 @@ export class ClaudeAcpAgent {
                     _meta: {
                       claudeCode: {
                         toolName: message.tool_name,
+                        ...(parentToolUseId ? { parentToolUseId } : {}),
                         toolResponse: {
                           decisionReasonType: message.decision_reason_type,
                           decisionReason: message.decision_reason,
@@ -2988,7 +3071,12 @@ export class ClaudeAcpAgent {
               // an autonomous cycle's state lands on the next user turn's
               // result. Runs even when the turn errors or was cancelled.
               if (!isAutonomousResult) {
-                await this.syncFastModeState(params.sessionId, session, message.fast_mode_state);
+                await this.syncFastModeState(
+                  params.sessionId,
+                  session,
+                  message.fast_mode_state,
+                  message.fast_mode_disabled_reason,
+                );
               }
 
               // A user-turn result needs an active turn so its stop reason is
@@ -3673,11 +3761,15 @@ export class ClaudeAcpAgent {
               // Consumed: reset so the next message's blocks accumulate fresh and
               // the record stays bounded to the in-flight message.
               streamedBlocks.length = 0;
-            } else if (message.type === "assistant") {
-              // Subagent assistant message (`parent_tool_use_id !== null`). It is
-              // never streamed live and its text/thinking is internal to the tool
-              // call — keep dropping it so subagent prose doesn't leak into the
-              // top-level feed.
+            } else if (
+              message.type === "assistant" &&
+              !(session.forwardSubagentText || supportsSubagentTranscript(this.clientCapabilities))
+            ) {
+              // Legacy clients don't understand nested transcripts. Keep the
+              // historical behavior for them: subagent text/thinking remains
+              // internal to the tool call instead of leaking into the top-level
+              // feed. Capable clients opt into the branch above unchanged, with
+              // `parentToolUseId` stamped by toAcpNotifications.
               content = message.message.content.filter(
                 (item) => item.type !== "text" && item.type !== "thinking",
               );
@@ -3717,11 +3809,30 @@ export class ClaudeAcpAgent {
             break;
           }
           case "tool_progress": {
+            // Not every beat reports under the id of a tool call the client has
+            // seen: heartbeats derive `<tool_use_id>-heartbeat-<n>`, and the
+            // `agent_api_retry` beats behind `subagentRetry` report under
+            // `agent_<assistant_message_id>`. Forwarding those verbatim leaves the
+            // client resolving an id it has never been told about (the same trap
+            // `ensureToolCallEmitted` documents for #851). The SDK stamps
+            // `parent_tool_use_id` with the executing tool's real id whenever the
+            // beat doesn't carry one of its own, so fall back to it rather than
+            // pattern-matching each synthetic id shape. Beats that do report a real
+            // id (a subagent's `bash_progress`, whose parent is the spawning Agent
+            // call) keep resolving to that id.
+            const toolCallId = session.emittedToolCalls.has(message.tool_use_id)
+              ? message.tool_use_id
+              : message.parent_tool_use_id;
+            // Ids leave `emittedToolCalls` at `tool_result`, so this also stops a
+            // beat that races past completion from reopening a finished call.
+            if (toolCallId === null || !session.emittedToolCalls.has(toolCallId)) {
+              break;
+            }
             await sendUpdate({
               sessionId: message.session_id,
               update: {
                 sessionUpdate: "tool_call_update",
-                toolCallId: message.tool_use_id,
+                toolCallId,
                 status: "in_progress",
                 _meta: {
                   claudeCode: {
@@ -4279,6 +4390,9 @@ export class ClaudeAcpAgent {
   private async replaySessionHistory(sessionId: string): Promise<void> {
     const toolUseCache: ToolUseCache = {};
     const messages = await getSessionMessages(sessionId);
+    const forwardSubagentText =
+      this.sessions[sessionId]?.forwardSubagentText ??
+      supportsSubagentTranscript(this.clientCapabilities);
 
     for (const message of messages) {
       // Backfill the ACP messageId -> SDK uuid mapping for messages we didn't
@@ -4300,6 +4414,10 @@ export class ClaudeAcpAgent {
 
       // @ts-expect-error - untyped in SDK but we handle all of these
       let content: unknown = message.message.content;
+      const parentToolUseId = parentToolUseIdOf(message);
+      if (message.type === "assistant" && parentToolUseId && !forwardSubagentText) {
+        content = stripSubagentTextAndThinking(content);
+      }
       // @ts-expect-error - untyped in SDK but we handle all of these
       if (message.message.role === "user") {
         content = stripLocalCommandMetadata(content);
@@ -4321,6 +4439,7 @@ export class ClaudeAcpAgent {
           cwd: this.sessions[sessionId]?.cwd,
           taskState: this.sessions[sessionId]?.taskState,
           messageId: replayMessageId,
+          parentToolUseId,
         },
       )) {
         await this.client.sessionUpdate(notification);
@@ -4867,6 +4986,14 @@ export class ClaudeAcpAgent {
         session.modes = { ...session.modes, availableModes: newAvailableModes };
       }
 
+      // `model_not_allowed` described the model we just left, so it must not
+      // follow us onto the new one; the remaining reasons are account- or
+      // environment-scoped and stay true across a switch. Either way the next
+      // init/result report refreshes this.
+      if (session.fastModeDisabledReason === "model_not_allowed") {
+        session.fastModeDisabledReason = undefined;
+      }
+
       // Rebuild config options since effort levels depend on the selected model
       const effortOpt = session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
       const currentEffort =
@@ -4885,6 +5012,7 @@ export class ClaudeAcpAgent {
           supported: newModelInfo?.supportsFastMode ?? false,
           enabled: session.fastModeEnabled,
           useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
+          disabledReason: session.fastModeDisabledReason,
         },
       );
 
@@ -4983,6 +5111,7 @@ export class ClaudeAcpAgent {
     const refreshed = createFastModeConfigOption(
       enabled,
       clientSupportsBooleanConfigOptions(this.clientCapabilities),
+      session.fastModeDisabledReason,
     );
     session.configOptions = session.configOptions.map((o) =>
       o.id === FAST_MODE_CONFIG_ID ? refreshed : o,
@@ -5016,11 +5145,19 @@ export class ClaudeAcpAgent {
    *     here).
    *   - `cooldown`: a transient suspension of an already-enabled fast mode.
    *     Leave the toggle as-is rather than flapping it — and never let a stray
-   *     cooldown spuriously enable a toggle the user has off. */
+   *     cooldown spuriously enable a toggle the user has off.
+   *
+   *  `reason` is the SDK's `fast_mode_disabled_reason`, reported alongside the
+   *  state. Only explainable reasons are retained (see
+   *  {@link normalizeFastModeDisabledReason}), so the comparison below tracks
+   *  exactly what the user can see: a routine `sdk_opt_in_required` report on
+   *  every turn's result can't churn the option, while a real blocker updates
+   *  the description even when the toggle's own value is unchanged. */
   private async syncFastModeState(
     sessionId: string,
     session: Session,
     state: FastModeState | undefined,
+    reason?: FastModeDisabledReason,
   ): Promise<void> {
     if (state === undefined) {
       return;
@@ -5032,11 +5169,31 @@ export class ClaudeAcpAgent {
       return;
     }
     const enabled = state === "on";
-    if (enabled === session.fastModeEnabled) {
+    // A reason only describes an off state; drop any that rides an `on` report
+    // so it can't decorate the option the next time fast mode goes off.
+    const nextReason = enabled ? undefined : normalizeFastModeDisabledReason(reason);
+    if (enabled === session.fastModeEnabled && nextReason === session.fastModeDisabledReason) {
       return;
     }
+    // The user asked for Fast mode and the SDK is telling us it can't serve it.
+    // The description carries the same explanation, but a toggle silently
+    // snapping back is the case worth saying out loud once, at the flip.
+    const explain = session.fastModeEnabled && !enabled && nextReason !== undefined;
     session.fastModeEnabled = enabled;
+    session.fastModeDisabledReason = nextReason;
     this.refreshFastModeOption(session, enabled);
+    if (explain) {
+      await this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: `**Fast mode turned off:** ${FAST_MODE_UNAVAILABLE_EXPLANATIONS[nextReason]}.`,
+          },
+        },
+      });
+    }
     await this.client.sessionUpdate({
       sessionId,
       update: {
@@ -5201,6 +5358,9 @@ export class ClaudeAcpAgent {
     // Extract options from _meta if provided
     const sessionMeta = params._meta as NewSessionMeta | undefined;
     const userProvidedOptions = sessionMeta?.claudeCode?.options;
+    const forwardSubagentText =
+      supportsSubagentTranscript(this.clientCapabilities) ||
+      userProvidedOptions?.forwardSubagentText === true;
 
     // Configure thinking behavior from environment variable
     const thinking = resolveThinkingConfig(process.env.MAX_THINKING_TOKENS, this.logger);
@@ -5279,6 +5439,7 @@ export class ClaudeAcpAgent {
       // Override certain fields that must be controlled by ACP
       cwd: params.cwd,
       includePartialMessages: true,
+      forwardSubagentText,
       mcpServers: { ...(userProvidedOptions?.mcpServers || {}), ...mcpServers },
       // If we want bypassPermissions to be an option, we have to allow it here.
       // But it doesn't work in root mode, so we only activate it if it will work.
@@ -5542,10 +5703,18 @@ export class ClaudeAcpAgent {
     const fastModeEnabled =
       initializationResult.fast_mode_state !== undefined &&
       fastModeStateEnabled(initializationResult.fast_mode_state);
+    // `fast_mode_disabled_reason` reflects the post-switch model since SDK
+    // 0.3.219 (the initialize response used to answer from the spawn-time
+    // model). A fresh SDK session reports `sdk_opt_in_required` — the toggle IS
+    // the opt-in — which normalizes away, so only real blockers are retained.
+    const fastModeDisabledReason = fastModeEnabled
+      ? undefined
+      : normalizeFastModeDisabledReason(initializationResult.fast_mode_disabled_reason);
     const fastMode: FastModeOptionState = {
       supported: currentModelInfo?.supportsFastMode ?? false,
       enabled: fastModeEnabled,
       useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
+      disabledReason: fastModeDisabledReason,
     };
 
     const configOptions = buildConfigOptions(
@@ -5621,8 +5790,10 @@ export class ClaudeAcpAgent {
       agents,
       currentAgent,
       fastModeEnabled,
+      fastModeDisabledReason,
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
+      forwardSubagentText,
       contextWindowSize: seededWindow.size,
       contextWindowAuthoritative: seededWindow.authoritative,
       providerCacheKey,
@@ -5927,6 +6098,36 @@ export function fastModeStateEnabled(state: FastModeState): boolean {
   return state !== "off";
 }
 
+/** User-facing explanations for the SDK's `fast_mode_disabled_reason` values
+ *  that a user can act on (or at least wants to know about). Deliberately
+ *  partial — the omitted reasons are not worth surfacing:
+ *   - `sdk_opt_in_required`: every SDK session starts here (the toggle IS the
+ *     opt-in), so it describes the default, not a problem.
+ *   - `preference`: the user turned Fast mode off themselves.
+ *   - `pending`: eligibility is still resolving; the next report supersedes it.
+ *   - `unknown`: nothing meaningful to say.
+ *  Unknown future reasons fall through the same way (open set — the SDK's docs
+ *  say to ignore values you don't handle). */
+const FAST_MODE_UNAVAILABLE_EXPLANATIONS: Partial<Record<FastModeDisabledReason, string>> = {
+  free: "not available on the free plan",
+  extra_usage_disabled: "requires extra usage to be enabled for this account",
+  model_not_allowed: "not available for the selected model",
+  not_first_party: "not available on this API provider",
+  disabled_by_env: "disabled by environment configuration",
+  network_error: "eligibility could not be verified (network error)",
+};
+
+/** Normalize an SDK-reported `fast_mode_disabled_reason` to the one we retain:
+ *  a reason we have an explanation for, else `undefined`. Keeping only
+ *  explainable reasons means state comparisons (see `syncFastModeState`) track
+ *  exactly what the user can see, so routine reports like
+ *  `sdk_opt_in_required` never churn the config option. */
+export function normalizeFastModeDisabledReason(
+  reason: FastModeDisabledReason | undefined,
+): FastModeDisabledReason | undefined {
+  return reason && FAST_MODE_UNAVAILABLE_EXPLANATIONS[reason] ? reason : undefined;
+}
+
 /** Whether the Client advertised support for boolean session config options
  *  (`session.configOptions.boolean`). Agents MUST only send `type: "boolean"`
  *  config options to Clients that opt in; otherwise we fall back to a `select`.
@@ -5940,15 +6141,25 @@ export function clientSupportsBooleanConfigOptions(
 /** Build the Fast mode config option. When the Client supports boolean config
  *  options we expose a native `type: "boolean"` toggle; otherwise we degrade to
  *  a two-value `select` ("on"/"off") so older Clients still get a usable
- *  control. */
+ *  control.
+ *
+ *  `disabledReason` (the SDK's `fast_mode_disabled_reason`) is folded into the
+ *  description while the toggle reads off, so a user whose account or provider
+ *  can't serve Fast mode sees why instead of a switch that silently refuses to
+ *  stay on. Ignored while enabled: a reason reported alongside an `on`/`cooldown`
+ *  state isn't blocking anything right now. */
 export function createFastModeConfigOption(
   enabled: boolean,
   useBooleanOption: boolean,
+  disabledReason?: FastModeDisabledReason,
 ): SessionConfigOption {
+  const explanation = enabled
+    ? undefined
+    : disabledReason && FAST_MODE_UNAVAILABLE_EXPLANATIONS[disabledReason];
   const base = {
     id: FAST_MODE_CONFIG_ID,
     name: "Fast mode",
-    description: FAST_MODE_DESCRIPTION,
+    description: explanation ? `${FAST_MODE_DESCRIPTION} — ${explanation}` : FAST_MODE_DESCRIPTION,
     category: "model_config",
   } as const;
 
@@ -5991,6 +6202,9 @@ export type FastModeOptionState = {
   enabled: boolean;
   /** Whether the Client opted into boolean config options. */
   useBooleanOption: boolean;
+  /** Latest explainable `fast_mode_disabled_reason`, folded into the option's
+   *  description while the toggle reads off. */
+  disabledReason?: FastModeDisabledReason;
 };
 
 export function buildConfigOptions(
@@ -6068,7 +6282,13 @@ export function buildConfigOptions(
   // option renders as a native boolean toggle for Clients that opted in, and a
   // two-value select otherwise.
   if (fastMode?.supported) {
-    options.push(createFastModeConfigOption(fastMode.enabled, fastMode.useBooleanOption));
+    options.push(
+      createFastModeConfigOption(
+        fastMode.enabled,
+        fastMode.useBooleanOption,
+        fastMode.disabledReason,
+      ),
+    );
   }
 
   // Only surface the Agent picker when there's a real choice — i.e. the user
@@ -6723,6 +6943,29 @@ function shouldEmitToolCall(toolName: string): boolean {
   return toolName !== "TodoWrite" && !isTaskTool(toolName);
 }
 
+/** Build the Claude Code-specific metadata for a tool call. Bash descriptions
+ *  are kept out of ACP's standard `title`, which clients may use as the shell
+ *  command preview, while still giving clients access to Claude's concise
+ *  human-readable title. */
+function claudeCodeMetaFromToolUse(toolUse: {
+  name: string;
+  input?: unknown;
+}): NonNullable<ToolUpdateMeta["claudeCode"]> {
+  const description =
+    toolUse.name === "Bash" &&
+    toolUse.input !== null &&
+    typeof toolUse.input === "object" &&
+    "description" in toolUse.input &&
+    typeof toolUse.input.description === "string"
+      ? toolUse.input.description
+      : undefined;
+  return {
+    toolName: toolUse.name,
+    ...(description ? { title: description } : {}),
+    ...((toolUse.name === "Agent" || toolUse.name === "Task") && { subagent: true as const }),
+  };
+}
+
 /** Build the `tool_call` (or, with `refine`, the `tool_call_update`)
  *  notification for a tool_use. Shared by every site that surfaces a tool call:
  *  the streamed tool_use path (first encounter → tool_call, later encounter →
@@ -6739,7 +6982,7 @@ function toolCallNotification(
 ): SessionNotification["update"] {
   if (refine) {
     return {
-      _meta: { claudeCode: { toolName: toolUse.name } } satisfies ToolUpdateMeta,
+      _meta: { claudeCode: claudeCodeMetaFromToolUse(toolUse) } satisfies ToolUpdateMeta,
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call_update",
       rawInput,
@@ -6748,7 +6991,7 @@ function toolCallNotification(
   }
   return {
     _meta: {
-      claudeCode: { toolName: toolUse.name },
+      claudeCode: claudeCodeMetaFromToolUse(toolUse),
       ...(toolUse.name === "Bash" && supportsTerminalOutput
         ? { terminal_info: { terminal_id: toolUse.id } }
         : {}),
@@ -6783,7 +7026,9 @@ function streamedInputRefinement(
     cwd,
   );
   return {
-    _meta: { claudeCode: { toolName: toolUse.name } } satisfies ToolUpdateMeta,
+    _meta: {
+      claudeCode: claudeCodeMetaFromToolUse({ ...toolUse, input }),
+    } satisfies ToolUpdateMeta,
     toolCallId: toolUse.id,
     sessionUpdate: "tool_call_update",
     rawInput: input,
