@@ -6,7 +6,7 @@ on:
       version:
         description: "Standalone release version, without leading v"
         required: true
-        default: "0.49.0-jaz.1"
+        default: "0.69.0-jaz.1"
 
 permissions:
   contents: write
