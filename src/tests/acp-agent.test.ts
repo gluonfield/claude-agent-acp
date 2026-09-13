@@ -56,12 +56,13 @@ import {
   forkSession,
   getSessionInfo,
   getSessionMessages,
+  importSessionToStore,
   PermissionUpdate,
   query,
   SDKAssistantMessage,
   type SDKControlGetUsageResponse,
 } from "@anthropic-ai/claude-agent-sdk";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { readFile } from "node:fs/promises";
 import {
   mockSessionState,
@@ -83,6 +84,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
     deleteSession: vi.fn(),
     forkSession: vi.fn(),
     getSessionInfo: vi.fn(),
+    importSessionToStore: vi.fn(actual.importSessionToStore),
     // Delegates to the real implementation so integration tests that read
     // actual transcripts keep working; unit tests override per-call with
     // `mockResolvedValueOnce`.
@@ -3227,7 +3229,6 @@ describe("permission request cancellation", () => {
       emitRawSDKMessages: false,
       forwardSubagentText: false,
       contextWindowSize: 200000,
-      contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
       toolUseCache: {},
@@ -8384,6 +8385,7 @@ describe("logout", () => {
         "agentFileChangeReport",
         "nativeSubagentSessions",
         "asyncTasks",
+        "recommendedValue",
       ],
     });
   });
@@ -8402,12 +8404,19 @@ describe("logout", () => {
         "agentFileChangeReport",
         "nativeSubagentSessions",
         "asyncTasks",
+        "recommendedValue",
       ],
     });
   });
 });
 
 describe("session/fork", () => {
+  beforeEach(() => {
+    vi.mocked(forkSession).mockClear();
+    vi.mocked(getSessionMessages).mockClear();
+    vi.mocked(importSessionToStore).mockClear();
+  });
+
   it("forks the latest turn in the requested workspace", async () => {
     const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
@@ -8428,6 +8437,18 @@ describe("session/fork", () => {
     const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
     vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "assistant",
+        uuid: "assistant-thinking-uuid",
+        session_id: "source-id",
+        message: {
+          id: "msg_123",
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "hidden" }],
+        },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+      },
       {
         type: "assistant",
         uuid: "assistant-uuid",
@@ -8451,9 +8472,140 @@ describe("session/fork", () => {
 
     expect(response.sessionId).toBe("fork-id");
     expect(getSessionMessages).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
+    expect(importSessionToStore).not.toHaveBeenCalled();
     expect(forkSession).toHaveBeenCalledWith("source-id", {
       dir: "/workspace",
       upToMessageId: "assistant-uuid",
+    });
+  });
+
+  it.each([
+    {
+      resolution: "its ACP message id",
+      messageId: "persisted-message-id:segment:0",
+      messageOccurrence: 1,
+    },
+    {
+      resolution: "its fingerprint occurrence",
+      messageId: "stale-air-message-id:segment:0",
+      messageOccurrence: 2,
+    },
+  ])("forks at an inactive persisted branch by $resolution", async (forkPoint) => {
+    const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    const targetText = "Answer from the branch that is no longer active.";
+    const targetFingerprint = `sha256:${createHash("sha256").update(targetText).digest("hex")}`;
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "assistant",
+        uuid: "active-assistant-uuid",
+        session_id: "source-id",
+        message: { id: "active-message-id", role: "assistant", content: [] },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+      },
+    ]);
+    vi.mocked(importSessionToStore).mockImplementationOnce(async (_sessionId, store) => {
+      await store.append({ projectKey: "-workspace", sessionId: "source-id" }, [
+        {
+          type: "assistant",
+          uuid: "earlier-duplicate-uuid",
+          parentUuid: "earlier-user-uuid",
+          isSidechain: false,
+          sessionId: "source-id",
+          message: {
+            id: "earlier-duplicate-message-id",
+            role: "assistant",
+            content: [{ type: "text", text: targetText }],
+          },
+        },
+        {
+          type: "user",
+          uuid: "inactive-user-uuid",
+          parentUuid: "earlier-duplicate-uuid",
+          isSidechain: false,
+          sessionId: "source-id",
+          message: { role: "user", content: "regenerate" },
+        },
+        {
+          type: "assistant",
+          uuid: "inactive-thinking-uuid",
+          parentUuid: "inactive-user-uuid",
+          isSidechain: false,
+          sessionId: "source-id",
+          message: {
+            id: "persisted-message-id",
+            role: "assistant",
+            content: [{ type: "thinking", thinking: "Hidden reasoning" }],
+          },
+        },
+        {
+          type: "assistant",
+          uuid: "inactive-assistant-uuid",
+          parentUuid: "inactive-thinking-uuid",
+          isSidechain: false,
+          sessionId: "source-id",
+          message: {
+            id: "persisted-message-id",
+            role: "assistant",
+            content: [{ type: "text", text: targetText }],
+          },
+        },
+        {
+          type: "assistant",
+          uuid: "nested-assistant-uuid",
+          parentUuid: "nested-user-uuid",
+          isSidechain: true,
+          sessionId: "source-id",
+          message: {
+            id: "persisted-message-id",
+            role: "assistant",
+            content: [{ type: "text", text: targetText }],
+          },
+        },
+        {
+          type: "assistant",
+          uuid: "active-assistant-uuid",
+          parentUuid: "active-user-uuid",
+          isSidechain: false,
+          sessionId: "source-id",
+          message: {
+            id: "active-message-id",
+            role: "assistant",
+            content: [{ type: "text", text: "Answer from the active branch." }],
+          },
+        },
+      ]);
+    });
+    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
+
+    const response = await agent.unstable_forkSession({
+      sessionId: "source-id",
+      cwd: "/workspace",
+      additionalDirectories: [],
+      mcpServers: [],
+      _meta: {
+        jetbrains: {
+          air: {
+            fork: {
+              version: 1,
+              messageId: forkPoint.messageId,
+              messageFingerprint: targetFingerprint,
+              messageOccurrence: forkPoint.messageOccurrence,
+            },
+          },
+        },
+      },
+    });
+
+    expect(response.sessionId).toBe("fork-id");
+    expect(importSessionToStore).toHaveBeenLastCalledWith("source-id", expect.any(Object), {
+      dir: "/workspace",
+      includeSubagents: false,
+    });
+    expect(forkSession).toHaveBeenLastCalledWith("source-id", {
+      dir: "/workspace",
+      upToMessageId: "inactive-assistant-uuid",
     });
   });
 });
@@ -8500,7 +8652,6 @@ describe("session/close", () => {
       emitRawSDKMessages: false,
       forwardSubagentText: false,
       contextWindowSize: 200000,
-      contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
       toolUseCache: {},
@@ -8596,7 +8747,6 @@ describe("session/delete", () => {
       emitRawSDKMessages: false,
       forwardSubagentText: false,
       contextWindowSize: 200000,
-      contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
       toolUseCache: {},
@@ -8709,7 +8859,6 @@ describe("getOrCreateSession param change detection", () => {
       emitRawSDKMessages: false,
       forwardSubagentText: false,
       contextWindowSize: 200000,
-      contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
       toolUseCache: {},
@@ -9107,10 +9256,7 @@ describe("usage_update computation", () => {
     expect(usageUpdates[2].update.cost).toBeDefined();
   });
 
-  it("mid-stream size is inferred from a 1M model name before the first result", async () => {
-    // On the very first prompt there is no learned context window yet, so the
-    // mid-stream update would otherwise fall back to 200k. A "-1m" suffix in
-    // the SDK model ID is enough signal to emit 1_000_000 up front.
+  it("mid-stream size stays unknown until the provider reports the limit", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
       createStreamEvent("message_start", {
@@ -9139,11 +9285,13 @@ describe("usage_update computation", () => {
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
+    agent.sessions["test-session"].contextWindowSize = 0;
+
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdates).toHaveLength(2);
-    expect(usageUpdates[0].update.size).toBe(1000000);
+    expect(usageUpdates[0].update.size).toBe(0);
     expect(usageUpdates[1].update.size).toBe(1000000);
   });
 
@@ -9233,14 +9381,11 @@ describe("usage_update computation", () => {
     expect(usageUpdates[1].update.size).toBe(1000000);
   });
 
-  it("switching to a 1M model seeds the context window from the heuristic", async () => {
-    // The heuristic runs at config-change time so mid-stream updates in the
-    // next prompt already report 1M — without waiting for message_start or
-    // the next `result` to correct us.
+  it("switching to a fresh model keeps its window unknown until its result", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
       createStreamEvent("message_start", {
-        model: "claude-opus-4-6-1m",
+        model: "claude-cold-context-probe[1m]",
         usage: {
           input_tokens: 2000,
           output_tokens: 1000,
@@ -9250,7 +9395,7 @@ describe("usage_update computation", () => {
       }),
       createResultMessageWithModel({
         modelUsage: {
-          "claude-opus-4-6-1m": {
+          "claude-cold-context-probe[1m]": {
             inputTokens: 2000,
             outputTokens: 1000,
             cacheReadInputTokens: 0,
@@ -9271,24 +9416,19 @@ describe("usage_update computation", () => {
       "test-session",
       session,
       "model",
-      "claude-opus-4-6-1m",
+      "claude-cold-context-probe[1m]",
     );
-    expect(session.contextWindowSize).toBe(1000000);
+    expect(session.contextWindowSize).toBe(0);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdates).toHaveLength(2);
-    expect(usageUpdates[0].update.size).toBe(1000000);
+    expect(usageUpdates[0].update.size).toBe(0);
     expect(usageUpdates[1].update.size).toBe(1000000);
   });
 
-  it("infers the 1M window from a model's description when the ID lacks a 1m token (issue #596)", async () => {
-    // Semantic aliases like `default` resolve to a 1M-context model but carry
-    // no "1m" token in the modelId — the SDK signals 1M only via the
-    // human-facing displayName/description (e.g. "Opus 4.7 with 1M context").
-    // Inference must read those so the session reports the correct window from
-    // the first mid-stream update instead of the 200k placeholder.
+  it("does not infer a context limit from a model description", async () => {
     const { agent } = createMockAgentWithCapture();
     injectSession(agent, [{ type: "system", subtype: "session_state_changed", state: "idle" }]);
     const session = agent.sessions["test-session"];
@@ -9300,7 +9440,7 @@ describe("usage_update computation", () => {
 
     await (agent as any).applyConfigOptionValue("test-session", session, "model", "default");
 
-    expect(session.contextWindowSize).toBe(1000000);
+    expect(session.contextWindowSize).toBe(0);
   });
 
   it("result with no matching modelUsage preserves the learned window", async () => {
@@ -9341,10 +9481,6 @@ describe("usage_update computation", () => {
   });
 
   it("switching the session's model invalidates the learned context window", async () => {
-    // When the user switches models mid-session, the window learned for the
-    // previous model would otherwise persist into the next prompt's first
-    // mid-stream update. applyConfigOptionValue should reset it so the next
-    // turn's first update falls back to the heuristic (here: 200k default).
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
       createStreamEvent("message_start", {
@@ -9376,7 +9512,6 @@ describe("usage_update computation", () => {
     session.contextWindowSize = 1000000;
     session.models = { ...session.models, currentModelId: "claude-opus-4-6-1m" };
 
-    // User flips the selector to a 200k model.
     await (agent as any).applyConfigOptionValue(
       "test-session",
       session,
@@ -9388,7 +9523,7 @@ describe("usage_update computation", () => {
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdates).toHaveLength(2);
-    expect(usageUpdates[0].update.size).toBe(200000);
+    expect(usageUpdates[0].update.size).toBe(0);
     expect(usageUpdates[1].update.size).toBe(200000);
   });
 
@@ -9542,6 +9677,46 @@ describe("usage_update computation", () => {
     expect(usageUpdate).toBeDefined();
     // size should be 1000000 (Opus), not 200000 (min of both)
     expect(usageUpdate.update.size).toBe(1000000);
+  });
+
+  it("does not borrow a window from another model with a shared name prefix", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createAssistantMessage({ model: "claude-haiku-4-5-20251001" }),
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-opus-4-20250514": {
+            inputTokens: 100,
+            outputTokens: 50,
+            cacheReadInputTokens: 20,
+            cacheCreationInputTokens: 10,
+            webSearchRequests: 0,
+            costUSD: 0.01,
+            contextWindow: 1000000,
+            maxOutputTokens: 16384,
+          },
+          "claude-sonnet-4-20250514": {
+            inputTokens: 50,
+            outputTokens: 25,
+            cacheReadInputTokens: 10,
+            cacheCreationInputTokens: 5,
+            webSearchRequests: 0,
+            costUSD: 0.005,
+            contextWindow: 200000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    agent.sessions["test-session"].contextWindowSize = 0;
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdate).toBeDefined();
+    expect(usageUpdate.update.size).toBe(0);
   });
 
   it("after model switch, size updates to the new model's window", async () => {
@@ -9786,7 +9961,7 @@ describe("usage_update computation", () => {
     expect(usageUpdate.update.size).toBe(1000000);
   });
 
-  it("compact_boundary uses authoritative getContextUsage for used, keeps session window for size", async () => {
+  it("compact_boundary uses post_tokens without waiting for getContextUsage", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // No trailing idle: an idle with no preceding result now fails the turn as
     // abandoned (issue #825), and a real compaction turn always produces a
@@ -9810,18 +9985,18 @@ describe("usage_update computation", () => {
     // compaction — compaction frees occupancy, it doesn't change the window,
     // so the handler must not overwrite it from this response.
     session.contextWindowSize = 1000000;
-    (session.query as any).getContextUsage = vi
-      .fn()
-      .mockResolvedValue({ totalTokens: 12345, rawMaxTokens: 200000 });
+    const getContextUsage = vi.fn(() => new Promise<never>(() => {}));
+    (session.query as any).getContextUsage = getContextUsage;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdate).toBeDefined();
     expect(usageUpdate.update.used).toBe(12345);
-    // size stays at the session's learned window, NOT getContextUsage's value.
+    // size stays at the session's learned window; compaction changes occupancy only.
     expect(usageUpdate.update.size).toBe(1000000);
     expect(session.contextWindowSize).toBe(1000000);
+    expect(getContextUsage).not.toHaveBeenCalled();
     expect(updates.map((notification) => notification.update)).toContainEqual({
       sessionUpdate: "tool_call",
       toolCallId: "compact-boundary",
@@ -9847,7 +10022,7 @@ describe("usage_update computation", () => {
     });
   });
 
-  it("compact_boundary falls back to used:0 when getContextUsage fails", async () => {
+  it("compact_boundary falls back to used:0 when post_tokens is unavailable", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // No trailing idle — see the sibling test above (issue #825).
     injectSession(agent, [
@@ -9855,7 +10030,8 @@ describe("usage_update computation", () => {
     ]);
     const session = agent.sessions["test-session"];
     session.contextWindowSize = 200000;
-    (session.query as any).getContextUsage = vi.fn().mockRejectedValue(new Error("boom"));
+    const getContextUsage = vi.fn(() => new Promise<never>(() => {}));
+    (session.query as any).getContextUsage = getContextUsage;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
@@ -9864,6 +10040,7 @@ describe("usage_update computation", () => {
     expect(usageUpdate.update.used).toBe(0);
     expect(usageUpdate.update.size).toBe(200000);
     expect(session.contextWindowSize).toBe(200000);
+    expect(getContextUsage).not.toHaveBeenCalled();
   });
 
   it("caches the turn's authoritative window under the resolved id and serves it on a later switch, with no getContextUsage IPC", async () => {
@@ -9949,17 +10126,9 @@ describe("usage_update computation", () => {
   });
 
   it("scopes the window cache per provider: a switch on a different provider does not read another provider's window", async () => {
-    // The window is a property of (model id, provider). A turn on provider-A
-    // learns 500_000 for RESOLVED_ID; a switch to the SAME resolved id on
-    // provider-B must NOT read it (falls to inference → 1_000_000 for the "1m"
-    // id), while a switch on provider-A DOES read it (500_000). All three
-    // outcomes are distinct: cached 500_000 vs inference 1_000_000 vs default.
-    // Uses a unique resolved id ("claude-provkey-probe[1m]") so the module-global
-    // cache (not reset per test in this file) can't cross this test with others.
     const RESOLVED_ID = "claude-provkey-probe[1m]";
     const { agent } = createMockAgentWithCapture();
 
-    // Provider-A session learns the authoritative window on a turn.
     injectSession(agent, [
       createAssistantMessage({ model: "claude-provkey-probe" }),
       createResultMessageWithModel({
@@ -10002,8 +10171,6 @@ describe("usage_update computation", () => {
       },
     ];
 
-    // A DIFFERENT provider seeing the same resolved id must not inherit A's
-    // window — it falls to inference (1_000_000), not the cached 500_000.
     agent.sessions["session-B"] = mockSessionState({
       providerCacheKey: "apiType-B https://b.example",
       models: { currentModelId: "default", availableModels: [] },
@@ -10022,9 +10189,8 @@ describe("usage_update computation", () => {
       configId: "model",
       value: "alias",
     });
-    expect(agent.sessions["session-B"]!.contextWindowSize).toBe(1_000_000);
+    expect(agent.sessions["session-B"]!.contextWindowSize).toBe(0);
 
-    // The SAME provider (A) switching to that id DOES read the cached window.
     sessionA.contextWindowSize = 123_456; // sentinel
     sessionA.models = { currentModelId: "default", availableModels: [] };
     sessionA.modelInfos = modelInfos as any;
@@ -10038,10 +10204,6 @@ describe("usage_update computation", () => {
   });
 
   it("ignores a nonsensical (non-positive) reported window: keeps the prior window and doesn't poison the cache", async () => {
-    // A result.modelUsage that reports a non-positive contextWindow (observed
-    // from third-party backends) must not overwrite the window learned earlier,
-    // nor be written to the cross-session cache. Unique id keeps this isolated
-    // from other tests sharing the module-global cache (no resetModules here).
     const RESOLVED_ID = "claude-nonpositive-probe[1m]";
     const { agent } = createMockAgentWithCapture();
     injectSession(agent, [
@@ -10067,11 +10229,8 @@ describe("usage_update computation", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
 
-    // The bad window was ignored — the prior window is preserved.
     expect(session.contextWindowSize).toBe(900_000);
 
-    // And it never reached the cache: a switch to that id falls to inference
-    // (1_000_000 for the "1m" id), not the bad 0.
     session.contextWindowSize = 123_456; // sentinel
     session.models = { currentModelId: "default", availableModels: [] };
     session.modelInfos = [
@@ -10092,15 +10251,10 @@ describe("usage_update computation", () => {
       configId: "model",
       value: "alias",
     });
-    expect(session.contextWindowSize).toBe(1_000_000);
+    expect(session.contextWindowSize).toBe(0);
   });
 
-  it("does not let the message_start heuristic clobber an authoritative 200k window", async () => {
-    // An authoritative window can legitimately equal DEFAULT_CONTEXT_WINDOW
-    // (e.g. a third-party backend serving a 200k lane under a "[1m]"-spelled
-    // id). The message_start upgrade must key off the authoritative flag, not
-    // the value — otherwise the "1m" text match overwrites the cache-seeded
-    // 200k with 1M mid-stream on every turn.
+  it("preserves a reported limit when the model name suggests a different limit", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
       createStreamEvent("message_start", {
@@ -10112,15 +10266,11 @@ describe("usage_update computation", () => {
           cache_creation_input_tokens: 0,
         },
       }),
-      // Empty modelUsage: the result settles the turn without supplying a
-      // window of its own, so the assertion isolates the message_start path.
       createResultMessageWithModel({ modelUsage: {} }),
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
     const session = agent.sessions["test-session"]!;
-    // Simulate a cache-seeded authoritative window that equals the default.
     session.contextWindowSize = 200000;
-    session.contextWindowAuthoritative = true;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
 
@@ -10131,10 +10281,7 @@ describe("usage_update computation", () => {
     }
   });
 
-  it("still upgrades a heuristic default window from the message_start model id", async () => {
-    // Companion to the authoritative-200k test: with no authoritative seed the
-    // old behavior stands — a "1m"-carrying live model id upgrades the default
-    // mid-stream so usage_update reports the right size before the result.
+  it("keeps the limit unknown when only the streamed model name contains 1m", async () => {
     const { agent } = createMockAgentWithCapture();
     injectSession(agent, [
       createStreamEvent("message_start", {
@@ -10146,16 +10293,15 @@ describe("usage_update computation", () => {
           cache_creation_input_tokens: 0,
         },
       }),
-      // Empty modelUsage: settles the turn without a window of its own.
       createResultMessageWithModel({ modelUsage: {} }),
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
     const session = agent.sessions["test-session"]!;
-    expect(session.contextWindowAuthoritative).toBe(false);
+    session.contextWindowSize = 0;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
 
-    expect(session.contextWindowSize).toBe(1_000_000);
+    expect(session.contextWindowSize).toBe(0);
   });
 
   it("caches the turn's window under the bare assistant-message id too, so resolvedModel-less rows can hit", async () => {
@@ -10195,7 +10341,6 @@ describe("usage_update computation", () => {
     // Switch to a row registered under the bare id with NO resolvedModel —
     // the shape of the out-of-allowlist resume row.
     session.contextWindowSize = 123_456; // sentinel
-    session.contextWindowAuthoritative = false;
     session.models = { currentModelId: "default", availableModels: [] };
     session.modelInfos = [{ value: BARE_ID, displayName: "Bare", description: "probe" }] as any;
     session.configOptions = [
@@ -10216,7 +10361,6 @@ describe("usage_update computation", () => {
     });
 
     expect(session.contextWindowSize).toBe(555_000);
-    expect(session.contextWindowAuthoritative).toBe(true);
   });
 });
 
@@ -11935,7 +12079,6 @@ describe("post-error recovery", () => {
       emitRawSDKMessages: false,
       forwardSubagentText: false,
       contextWindowSize: 200000,
-      contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
       toolUseCache: {},
@@ -16508,7 +16651,6 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       emitRawSDKMessages: false,
       forwardSubagentText: false,
       contextWindowSize: 200000,
-      contextWindowAuthoritative: false,
       providerCacheKey: "default",
       taskState: new Map(),
       toolUseCache: {},
@@ -18208,7 +18350,6 @@ describe("agent selection config option", () => {
         emitRawSDKMessages: false,
         forwardSubagentText: false,
         contextWindowSize: 200000,
-        contextWindowAuthoritative: false,
         providerCacheKey: "default",
         taskState: new Map(),
         toolUseCache: {},

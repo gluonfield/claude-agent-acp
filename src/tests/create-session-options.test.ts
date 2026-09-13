@@ -5,14 +5,17 @@ import {
   SessionNotification,
 } from "@agentclientprotocol/sdk";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk";
-import type { Options } from "@anthropic-ai/claude-agent-sdk";
+import { getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+const applyFlags = vi.hoisted(() => vi.fn());
 let capturedOptions: Options | undefined;
 let contextUsageResult: (() => Promise<{ rawMaxTokens: number; model?: string }>) | undefined;
+let sessionMessages: Record<string, unknown>[];
+let sessionMessagesResult: () => Promise<Record<string, unknown>[]>;
 let initModels: Record<string, unknown>[] | undefined;
 let setModelImpl: ((model: string) => Promise<void>) | undefined;
 let mcpServerStatusResult: () => Promise<Array<{ name: string; status: string }>>;
@@ -31,6 +34,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
       return makeMockQuery({
+        applyFlagSettings: applyFlags,
         initializationResult: async () => ({
           models: initModels ?? [
             {
@@ -48,6 +52,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         mcpAuthenticate: (serverName: string) => mcpAuthenticateImpl(serverName),
       });
     },
+    getSessionMessages: vi.fn(() => sessionMessagesResult()),
   };
 });
 
@@ -74,7 +79,11 @@ describe("createSession options merging", () => {
 
   beforeEach(async () => {
     capturedOptions = undefined;
+    applyFlags.mockReset().mockResolvedValue(undefined);
     contextUsageResult = undefined;
+    sessionMessages = [];
+    sessionMessagesResult = async () => sessionMessages;
+    vi.mocked(getSessionMessages).mockClear();
     initModels = undefined;
     setModelImpl = undefined;
     mcpServerStatusResult = async () => [];
@@ -88,6 +97,29 @@ describe("createSession options merging", () => {
     ClaudeAcpAgent = acpAgent.ClaudeAcpAgent;
 
     agent = new ClaudeAcpAgent(createMockClient());
+  });
+
+  it("keeps SDK effort automatic when recommended values are enabled", async () => {
+    initModels = [
+      {
+        value: "claude-sonnet-4-6",
+        displayName: "Claude Sonnet",
+        description: "Fast",
+        supportsAutoMode: true,
+        supportsEffort: true,
+        supportedEffortLevels: ["low", "medium", "high"],
+      },
+    ];
+    (agent as any).clientCapabilities = {
+      _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
+    };
+    const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    expect(response.configOptions?.find((option) => option.id === "effort")).toMatchObject({
+      currentValue: "default",
+    });
+    expect(
+      applyFlags.mock.calls.filter(([settings]) => Object.hasOwn(settings, "effortLevel")),
+    ).toEqual([]);
   });
 
   it("merges user-provided disallowedTools with ACP internal list", async () => {
@@ -757,37 +789,113 @@ describe("createSession options merging", () => {
       expect(ctxSpy).not.toHaveBeenCalled();
     });
 
-    it("seeds contextWindowSize from text inference, falling back to the default when it misses", async () => {
-      // The mock model ("claude-sonnet-4-6" / "Claude Sonnet" / "Fast") carries
-      // no "1m" token anywhere, so inference misses and the window falls back to
-      // the default; the authoritative value arrives later via result.modelUsage.
+    it("keeps the context window unknown until the SDK reports it", async () => {
       contextUsageResult = async () => ({ rawMaxTokens: 967000 });
 
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
-      expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
-      expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
+      expect(sessionFor(response.sessionId).contextWindowSize).toBe(0);
     });
 
-    it("session/load seeds the window from the resumed session's getContextUsage report", async () => {
-      // Resumed sessions get getContextUsage serviced pre-turn (issue #845 uses
-      // it to restore the live model), and the same response carries the
-      // authoritative window (`rawMaxTokens`). After a process restart the
-      // module cache is empty and text inference misses natively-1M aliases, so
-      // discarding this in-hand value would replay the issue-#596 flicker on
-      // every reload — the flagship scenario. 888_000 can only come from the
-      // report: inference on the mock model yields null → 200_000 default.
-      contextUsageResult = async () => ({ rawMaxTokens: 888_000, model: "claude-sonnet-4-6" });
+    it("session/load restores the transcript model without waiting for getContextUsage", async () => {
+      // getContextUsage is a live CLI control request. On a real, large resumed
+      // session it can take tens of seconds before returning, so it must stay
+      // off the load critical path. Claude restores from this same last
+      // assistant model field, which is available through a local transcript
+      // read in milliseconds.
+      const ctxSpy = vi.fn(() => new Promise<never>(() => {}));
+      contextUsageResult = ctxSpy;
+      initModels = [
+        {
+          value: "default",
+          displayName: "Default",
+          description: "Default model",
+          resolvedModel: "claude-sonnet-4-6",
+        },
+        {
+          value: "haiku",
+          displayName: "Haiku",
+          description: "Fast",
+          resolvedModel: "claude-haiku-4-5",
+        },
+      ];
+      sessionMessages = [
+        {
+          type: "assistant",
+          uuid: "assistant-uuid",
+          session_id: "resumed-model-probe",
+          parent_tool_use_id: null,
+          parent_agent_id: null,
+          message: { model: "claude-haiku-4-5", role: "assistant", content: [] },
+        },
+      ];
 
-      await (
-        agent as unknown as {
-          createSession: (params: object, opts: { resume?: string }) => Promise<unknown>;
-        }
-      ).createSession({ cwd: process.cwd(), mcpServers: [] }, { resume: "resumed-window-probe" });
+      const response = await agent.loadSession({
+        sessionId: "resumed-model-probe",
+        cwd: process.cwd(),
+        mcpServers: [],
+      });
 
-      const session = sessionFor("resumed-window-probe");
-      expect(session.contextWindowSize).toBe(888_000);
-      expect(session.contextWindowAuthoritative).toBe(true);
+      expect(response.configOptions?.find((option) => option.id === "model")?.currentValue).toBe(
+        "haiku",
+      );
+      expect(ctxSpy).not.toHaveBeenCalled();
+      expect(getSessionMessages).toHaveBeenCalledTimes(1);
+      expect(getSessionMessages).toHaveBeenCalledWith("resumed-model-probe");
+    });
+
+    it("resume remains best-effort when the transcript hint cannot be read", async () => {
+      sessionMessagesResult = async () => {
+        throw new Error("unreadable transcript");
+      };
+
+      await expect(
+        agent.resumeSession({
+          sessionId: "unreadable-resume-probe",
+          cwd: process.cwd(),
+          mcpServers: [],
+        }),
+      ).resolves.toMatchObject({ sessionId: "unreadable-resume-probe" });
+    });
+
+    it("restores the transcript model for direct session/new resume metadata", async () => {
+      initModels = [
+        {
+          value: "default",
+          displayName: "Default",
+          description: "Default model",
+          resolvedModel: "claude-sonnet-4-6",
+        },
+        {
+          value: "haiku",
+          displayName: "Haiku",
+          description: "Fast",
+          resolvedModel: "claude-haiku-4-5",
+        },
+      ];
+      sessionMessages = [
+        {
+          type: "assistant",
+          uuid: "assistant-uuid",
+          session_id: "direct-resume-probe",
+          parent_tool_use_id: null,
+          parent_agent_id: null,
+          message: { model: "claude-haiku-4-5", role: "assistant", content: [] },
+        },
+      ];
+
+      const response = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { resume: "direct-resume-probe" } } },
+      });
+
+      expect(response.sessionId).toBe("direct-resume-probe");
+      expect(response.configOptions?.find((option) => option.id === "model")?.currentValue).toBe(
+        "haiku",
+      );
+      expect(getSessionMessages).toHaveBeenCalledOnce();
+      expect(getSessionMessages).toHaveBeenCalledWith("direct-resume-probe");
     });
 
     it("scopes providerCacheKey by per-session env routing", async () => {
@@ -991,9 +1099,22 @@ describe("createSession options merging", () => {
     ];
 
     let originalAnthropicModel: string | undefined;
+    let originalClaudeConfigDir: string | undefined;
+    let configDir: string;
     beforeEach(() => {
       originalAnthropicModel = process.env.ANTHROPIC_MODEL;
       delete process.env.ANTHROPIC_MODEL;
+      // These tests assert which model a fresh session lands on with no
+      // override in play, so both override tiers above the SDK's default have
+      // to be neutralized: ANTHROPIC_MODEL and `model` from the user
+      // settings tier. Without the second one, a developer whose own
+      // ~/.claude/settings.json pins a model (e.g. "opus[1m]") sees the
+      // session start on that model instead of models[0]. resolveSettings
+      // reads the user tier from CLAUDE_CONFIG_DIR at call time, so pointing
+      // it at an empty directory is enough.
+      originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+      configDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-model-config-"));
+      process.env.CLAUDE_CONFIG_DIR = configDir;
     });
     afterEach(() => {
       if (originalAnthropicModel !== undefined) {
@@ -1001,6 +1122,12 @@ describe("createSession options merging", () => {
       } else {
         delete process.env.ANTHROPIC_MODEL;
       }
+      if (originalClaudeConfigDir !== undefined) {
+        process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir;
+      } else {
+        delete process.env.CLAUDE_CONFIG_DIR;
+      }
+      fs.rmSync(configDir, { recursive: true, force: true });
     });
 
     it("tolerates a PreModelSwitch hook vetoing the fresh-session model pin", async () => {

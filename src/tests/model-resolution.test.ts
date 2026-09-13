@@ -6,8 +6,8 @@ import {
   resolveModelPreference,
   applyAvailableModelsAllowlist,
   matchResumedModel,
-  settingsEffortForModel,
-} from "../acp-agent.js";
+} from "../session-model.js";
+import { settingsEffortForModel } from "../session-effort.js";
 
 // Mirrors a real `supportedModels()` response: alias rows carry
 // `resolvedModel`, and "Sonnet 5" has no `major.minor` dot unlike older
@@ -186,6 +186,13 @@ describe("matchResumedModel", () => {
     expect(matchResumedModel(LIVE_SHAPED_MODELS, "claude-haiku-4-5-20251001").value).toBe("haiku");
   });
 
+  it("keeps a provider-reported variant distinct from a similar picker name", () => {
+    const result = matchResumedModel(LIVE_SHAPED_MODELS, "claude-opus-4-8-preview");
+    expect(result.value).toBe("claude-opus-4-8-preview");
+    expect(result.resolvedModel).toBeUndefined();
+    expect(result.supportsEffort).toBeUndefined();
+  });
+
   it("tracks a live model with no picker counterpart verbatim", () => {
     const result = matchResumedModel(LIVE_SHAPED_MODELS, "claude-gpt-99");
     expect(result.value).toBe("claude-gpt-99");
@@ -294,6 +301,20 @@ describe("settingsEffortForModel", () => {
 
     const byRawId = { modelSettings: { "claude-x": { effortLevel: "xhigh" as const } } };
     expect(settingsEffortForModel(byRawId, undefined, "claude-x")).toBe("xhigh");
+  });
+
+  it("matches equivalent -1m and [1m] modelSettings keys", () => {
+    const settings = {
+      effortLevel: "high" as const,
+      modelSettings: { "claude-sonnet-5-1m": { effortLevel: "low" as const } },
+    };
+    expect(
+      settingsEffortForModel(settings, {
+        ...SONNET,
+        value: "sonnet[1m]",
+        resolvedModel: "claude-sonnet-5[1m]",
+      }),
+    ).toBe("low");
   });
 
   it("falls back to the top-level effortLevel when no per-model entry matches", () => {

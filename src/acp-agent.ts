@@ -59,7 +59,6 @@ import {
   AgentInfo,
   CanUseTool,
   deleteSession,
-  EffortLevel,
   FastModeDisabledReason,
   FastModeState,
   getSessionMessages,
@@ -80,6 +79,7 @@ import {
   SDKMessage,
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
+  SessionMessage,
   SDKUserMessage,
   Settings,
   SlashCommand,
@@ -111,7 +111,12 @@ import {
   NativeSubagent,
   NativeSubagentRuntime,
 } from "./native-subagents.js";
-import { AIR_ASYNC_TASKS_CAPABILITY, withAirMeta } from "./air-extension.js";
+import {
+  AIR_ASYNC_TASKS_CAPABILITY,
+  AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+  clientSupportsAirCapability,
+  withAirMeta,
+} from "./air-extension.js";
 import {
   AsyncTaskRuntime,
   backgroundBashTaskFromToolResult,
@@ -155,6 +160,8 @@ import {
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
 import { forkSession } from "./fork-session.js";
+import { readResumedSession, type ResumedSessionSnapshot } from "./resumed-session.js";
+import { SessionTiming } from "./session-timing.js";
 import { ALLOW_BYPASS, resolvePermissionMode } from "./permissions/modes.js";
 import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
 import { buildClaudePermissionOptions } from "./permissions/options.js";
@@ -237,12 +244,36 @@ import {
   exitPlanModeRawOutput,
   observeExitPlanToolResults,
 } from "./exit-plan.js";
-import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
+import { DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./usage-markdown.js";
 
-export { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
+export { DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { MODE_CONFIG_ID, SessionModeManager } from "./session-mode.js";
+import {
+  applyAvailableModelsAllowlist,
+  buildModelConfigOption,
+  getAvailableModels,
+  MODEL_CONFIG_ID,
+  resolveModelPreference,
+  resolveReportedModel,
+  type SessionModelState,
+} from "./session-model.js";
+import {
+  buildEffortConfigOption,
+  EFFORT_CONFIG_ID,
+  mergeEffortSettings,
+  settingsEffortForModel,
+  toSdkEffortLevel,
+} from "./session-effort.js";
+
+export { EFFORT_CONFIG_ID, settingsEffortForModel } from "./session-effort.js";
+export {
+  applyAvailableModelsAllowlist,
+  matchResumedModel,
+  MODEL_CONFIG_ID,
+  resolveModelPreference,
+} from "./session-model.js";
 
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
@@ -304,8 +335,6 @@ const ZERO_USAGE = Object.freeze({
   cache_read_input_tokens: 0,
   cache_creation_input_tokens: 0,
 });
-
-const DEFAULT_CONTEXT_WINDOW = 200000;
 
 /** Floor after `session/cancel` before the adapter forces the active prompt
  *  loop to return "cancelled". `query.interrupt()` normally makes the SDK
@@ -526,15 +555,6 @@ function parseSteerRequest(params: unknown): SteerRequest {
     _meta: _meta as SteerMeta | null | undefined,
   };
 }
-
-/** Internal model-selection state. Mirrors the shape the ACP SDK exposed as
- *  `SessionModelState` before model selection moved entirely into
- *  `SessionConfigOption` (category "model"). Retained internally to track the
- *  current model and build the "model" config option. */
-type SessionModelState = {
-  availableModels: Array<{ modelId: string; name: string; description?: string }>;
-  currentModelId: string;
-};
 
 /** One in-flight `prompt()` call. A persistent per-session consumer (see
  *  `runConsumer`) drains the SDK query stream for the whole session and settles
@@ -771,6 +791,9 @@ export type Session = {
   /** Original ACP parameters used to recreate this query with a new provider. */
   creationParams?: NewSessionRequest;
   settingsManager: SettingsManager;
+  /** Higher-priority programmatic settings passed to query(). Retained so
+   * model switches resolve effort from the same effective settings as the SDK. */
+  effortSettingsOverride?: Settings;
   /** This session's title state and the turn-end logic that maintains it. */
   titles: SessionTitles;
   accumulatedUsage: AccumulatedUsage;
@@ -803,14 +826,8 @@ export type Session = {
    *  user's intent so it persists across model switches; the Fast mode config
    *  option is only surfaced while the selected model supports it. */
   fastModeEnabled: boolean;
-  /** Whether the user picked a non-default effort through the ACP picker this
-   *  session. A pin lives at the SDK's flag layer, which overrides the CLI's
-   *  persisted effort (including the per-model `modelSettings` entries), so it
-   *  follows the session across model switches; without one, the CLI resolves
-   *  effort itself and the Effort option is display-only. Cleared when the
-   *  user picks "Default" (the flag layer is cleared with it) or when a model
-   *  switch clamps the pin away. */
-  effortPinnedByUser?: boolean;
+  /** Explicit ACP/SDK effort override. Cleared by Default or an unsupported model switch. */
+  effortPinnedLevel?: string;
   /** Why the SDK currently can't serve Fast mode, when the reason is one worth
    *  telling the user about (see {@link FAST_MODE_UNAVAILABLE_EXPLANATIONS} —
    *  routine states like the SDK's own opt-in requirement normalize to
@@ -839,25 +856,9 @@ export type Session = {
    *  can ask concurrently; steering must remain non-interrupting until the last
    *  request settles. */
   pendingUserInputCount?: number;
-  /** Context window size of the session's current model, carried across
-   *  prompts so mid-stream usage_update notifications report a correct `size`
-   *  before the turn's first result message arrives. Seeded synchronously at
-   *  session creation and on model switches from the per-model cache or the
-   *  text heuristic (DEFAULT_CONTEXT_WINDOW when both miss; on session/load the
-   *  resumed session's own `getContextUsage` report wins, see
-   *  `readResumedLiveModel`), then confirmed — and the cache populated — by each
-   *  result's modelUsage. No extra `getContextUsage` IPC is on these paths: on a
-   *  fresh session it stalls until the first turn runs (see the seeding call
-   *  sites and `contextWindowCache`). */
+  /** SDK-reported context window; zero until the provider supplies it. */
   contextWindowSize: number;
   contextUsedTokens?: number;
-  /** Whether `contextWindowSize` came from an authoritative source (the
-   *  cross-session cache, a resumed session's `getContextUsage` report, or a
-   *  `result.modelUsage`) rather than the text heuristic / default. Guards the
-   *  mid-stream `message_start` heuristic upgrade: an authoritative window that
-   *  happens to equal DEFAULT_CONTEXT_WINDOW must not be mistaken for "unseeded"
-   *  and clobbered by a "1m" text match. */
-  contextWindowAuthoritative: boolean;
   /** Stable identifier of the LLM backend this session's query was created
    *  against, derived from the routing-relevant vars of the exact `env` handed
    *  to the SDK at query creation (see {@link providerCacheKeyFor}). The context
@@ -2099,6 +2100,7 @@ export class ClaudeAcpAgent {
           AGENT_FILE_CHANGE_REPORT_CAPABILITY,
           AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
           AIR_ASYNC_TASKS_CAPABILITY,
+          AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
         ),
         steering: {
           supported: true,
@@ -2130,6 +2132,7 @@ export class ClaudeAcpAgent {
     if (this.providerUpdate) await this.providerUpdate;
     return forkSession(params, {
       liveMessageIdToUuid: this.sessions[params.sessionId]?.messageIdToUuid,
+      logger: this.logger,
       messageIdForGrouping,
     });
   }
@@ -2147,10 +2150,14 @@ export class ClaudeAcpAgent {
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    const timing = new SessionTiming(this.logger, "load", params.sessionId);
     if (this.providerUpdate) await this.providerUpdate;
-    const result = await this.getOrCreateSession(params);
+    const resumedSession = await readResumedSession(params.sessionId, this.logger);
+    const result = await this.getOrCreateSession(params, resumedSession);
+    timing.phase("session-ready");
 
-    await this.replaySessionHistory(params.sessionId);
+    await this.replaySessionHistory(params.sessionId, resumedSession.messages);
+    timing.phase("replay");
 
     // Send available commands after replay so it doesn't interleave with history
     setTimeout(() => {
@@ -4111,14 +4118,11 @@ export class ClaudeAcpAgent {
                 // right after the user sees "Compacting completed", which is
                 // confusing and wrong.
                 //
-                // Prefer the SDK's authoritative post-compaction `used` via
-                // getContextUsage — it reflects the real retained context
-                // (system prompt + tools + surviving messages), which the
-                // per-message API usage numbers can't give us until the next
-                // turn's result. If the control request fails, fall back to the
-                // used:0 approximation: directionally correct (context just
-                // dropped dramatically) and replaced within seconds by the next
-                // result message.
+                // The compact boundary already carries the retained token
+                // count. Prefer it over a getContextUsage control request,
+                // which can block the live query for tens of seconds. Older
+                // SDK frames without post_tokens fall back to used:0 and are
+                // corrected by the next result message.
                 //
                 // `size` keeps coming from session.contextWindowSize —
                 // compaction frees occupancy, it doesn't change the model's
@@ -4132,10 +4136,10 @@ export class ClaudeAcpAgent {
                   compactMetadata ? contextCompactionMetadataFromBoundary(compactMetadata) : {},
                   true,
                 );
-                const usedTokens = await fetchContextUsedTokens(session.query, this.logger);
+                const usedTokens = compactMetadata?.post_tokens ?? 0;
                 lastAssistantUsage = null;
-                lastAssistantTotalUsage = usedTokens ?? 0;
-                session.contextUsedTokens = usedTokens ?? 0;
+                lastAssistantTotalUsage = usedTokens;
+                session.contextUsedTokens = usedTokens;
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -4890,7 +4894,6 @@ export class ClaudeAcpAgent {
                 matchingModelUsage.usage.contextWindow > 0
               ) {
                 session.contextWindowSize = matchingModelUsage.usage.contextWindow;
-                session.contextWindowAuthoritative = true;
                 // Authoritative: fold it into the cross-session cache keyed on
                 // (this session's provider, the resolved model id —
                 // matchingModelUsage.key, e.g. "claude-sonnet-5[1m]") so a later
@@ -5357,23 +5360,6 @@ export class ClaudeAcpAgent {
                 const model = message.event.message.model;
                 if (model && model !== "<synthetic>") {
                   lastAssistantModel = model;
-                  // Only upgrade from the heuristic default — once we have an
-                  // authoritative window (cache-seeded at session creation or
-                  // on a model switch, read from the resumed session on
-                  // session/load, confirmed by each `result`), trust it over
-                  // the heuristic. The flag, not the value, is the sentinel: an
-                  // authoritative window can legitimately equal
-                  // DEFAULT_CONTEXT_WINDOW (e.g. a backend serving a 200k lane
-                  // under a "[1m]"-spelled id) and must not be clobbered.
-                  if (
-                    !session.contextWindowAuthoritative &&
-                    session.contextWindowSize === DEFAULT_CONTEXT_WINDOW
-                  ) {
-                    const inferred = inferContextWindowFromModel(model);
-                    if (inferred !== null) {
-                      session.contextWindowSize = inferred;
-                    }
-                  }
                 }
               } else {
                 const usage = message.event.usage;
@@ -6491,9 +6477,17 @@ export class ClaudeAcpAgent {
     return { configOptions: session.configOptions };
   }
 
-  private async replaySessionHistory(sessionId: string): Promise<void> {
+  private async replaySessionHistory(
+    sessionId: string,
+    resumedMessages?: SessionMessage[],
+  ): Promise<void> {
+    const replayStartedAt = performance.now();
     const toolUseCache: ToolUseCache = {};
-    const messages = await getSessionMessages(sessionId);
+    const messages = resumedMessages ?? (await getSessionMessages(sessionId));
+    const historyLoadedAt = performance.now();
+    this.logger.log(
+      `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,
+    );
     const session = this.sessions[sessionId];
     const forwardSubagentText =
       session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities);
@@ -6828,6 +6822,10 @@ export class ClaudeAcpAgent {
         );
       }
     }
+    const replayFinishedAt = performance.now();
+    this.logger.log(
+      `[session/replay] sessionId=${sessionId} phase=publish durationMs=${Math.round(replayFinishedAt - historyLoadedAt)} totalMs=${Math.round(replayFinishedAt - replayStartedAt)} messages=${messages.length}`,
+    );
   }
 
   async readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
@@ -7322,27 +7320,13 @@ export class ClaudeAcpAgent {
     if (configId === MODE_CONFIG_ID) {
       this.sessionModes.syncConfig(session, value);
     } else if (configId === MODEL_CONFIG_ID) {
-      // `ModelInfo.supportsAutoMode` is the canonical SDK signal for applying
-      // the Auto fallback below; its `displayName`/`description` also let us infer the
-      // context window for semantic aliases (e.g. `default`) whose ID alone
-      // carries no "1m" token.
       const newModelInfo = session.modelInfos.find((m) => m.value === value);
       if (session.models.currentModelId !== value) {
-        // Seed the new model's context window WITHOUT any IPC on the switch
-        // path: cached authoritative value if we've already learned it (from a
-        // prior turn's `result.modelUsage`), else the text heuristic, else the
-        // default. We deliberately do NOT call `getContextUsage` here — before
-        // a fresh session's first prompt turn that control request is not
-        // serviced (~15s stall, issues #886/#880), and (because SDK control
-        // requests are serialized over one channel) it would drag the awaited
-        // `setModel` down with it. The authoritative window arrives on the
-        // first `result.modelUsage` for the model and is cached from there;
-        // until then a switched-to alias that has never run a turn shows the
-        // heuristic/default window, which self-corrects on its first response
-        // (matches pre-0.59.0 behavior).
-        const seeded = immediateContextWindow(session.providerCacheKey, value, newModelInfo);
-        session.contextWindowSize = seeded.size;
-        session.contextWindowAuthoritative = seeded.authoritative;
+        session.contextWindowSize = cachedContextWindow(
+          session.providerCacheKey,
+          value,
+          newModelInfo,
+        );
       }
       session.models = { ...session.models, currentModelId: value };
 
@@ -7365,12 +7349,23 @@ export class ClaudeAcpAgent {
       // /effort per model), then the legacy top-level value — so display
       // what it will actually run instead of dragging the old model's value
       // along.
-      const effortOpt = session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
-      const currentEffort =
-        typeof effortOpt?.currentValue === "string" ? effortOpt.currentValue : undefined;
-      const seedEffort = session.effortPinnedByUser
-        ? currentEffort
-        : settingsEffortForModel(session.settingsManager.getSettings(), newModelInfo, value);
+      const useRecommendedValue = clientSupportsRecommendedConfigValue(this.clientCapabilities);
+      const pinnedEffort = session.effortPinnedLevel;
+      const effortWasPinned = pinnedEffort !== undefined;
+      const effortPinnedForNewModel =
+        effortWasPinned &&
+        newModelInfo?.supportsEffort === true &&
+        newModelInfo.supportedEffortLevels?.some((level) => level === pinnedEffort) === true;
+      const seedEffort = effortPinnedForNewModel
+        ? pinnedEffort
+        : settingsEffortForModel(
+            mergeEffortSettings(
+              session.settingsManager.getSettings(),
+              session.effortSettingsOverride,
+            ),
+            newModelInfo,
+            value,
+          );
       session.configOptions = buildConfigOptions(
         session.modes,
         session.models,
@@ -7387,26 +7382,21 @@ export class ClaudeAcpAgent {
           useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
           disabledReason: session.fastModeDisabledReason,
         },
+        {
+          useRecommendedValue,
+        },
       );
 
-      // Sync effort with the SDK only when a user pin changed across the
-      // switch — i.e. the new model clamped it away (buildConfigOptions
-      // validated the seed against the new model's levels), where the flag
-      // must be cleared too or the SDK would keep running the old pin
-      // invisibly. Settings-derived seeds are display-only: the CLI resolves
-      // persisted effort itself, and pinning it at the flag layer would
-      // shadow the per-model values on every later switch.
-      if (session.effortPinnedByUser) {
-        const newEffortOpt = session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
-        const newEffort =
-          typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
-        if (newEffort !== currentEffort) {
-          await session.query.applyFlagSettings({
-            effortLevel: toSdkEffortLevel(newEffort),
-          });
-          if (newEffort === undefined || newEffort === "default") {
-            session.effortPinnedByUser = false;
-          }
+      if (effortWasPinned && !effortPinnedForNewModel) {
+        try {
+          await session.query.applyFlagSettings({ effortLevel: null });
+          session.effortPinnedLevel = undefined;
+        } catch (error) {
+          // The model changed, but the unsupported effort override is still active.
+          session.configOptions = session.configOptions.filter(
+            (option) => option.id !== EFFORT_CONFIG_ID,
+          );
+          this.logger.error(`Failed to clear effort after model switch to "${value}":`, error);
         }
       }
 
@@ -7432,19 +7422,23 @@ export class ClaudeAcpAgent {
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
+    } else if (configId === EFFORT_CONFIG_ID) {
+      // Apply first so a rejected control request cannot leave the displayed
+      // value ahead of the SDK flag layer.
+      await session.query.applyFlagSettings({
+        effortLevel: toSdkEffortLevel(value),
+      });
+      session.configOptions = session.configOptions.map((o) =>
+        o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
+      );
+      // "Default" clears the flag layer (toSdkEffortLevel → null), handing
+      // effort back to the CLI's persisted per-model resolution — so it
+      // un-pins; any other pick pins effort for the session.
+      session.effortPinnedLevel = value !== "default" ? value : undefined;
     } else {
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
-      if (configId === EFFORT_CONFIG_ID) {
-        await session.query.applyFlagSettings({
-          effortLevel: toSdkEffortLevel(value),
-        });
-        // "Default" clears the flag layer (toSdkEffortLevel → null), handing
-        // effort back to the CLI's persisted per-model resolution — so it
-        // un-pins; any other pick pins effort for the session.
-        session.effortPinnedByUser = value !== "default";
-      }
     }
   }
 
@@ -7467,7 +7461,7 @@ export class ClaudeAcpAgent {
     // `availableModels` allowlist — in which case we track the raw id: the
     // picker shows no selection, but the model-dependent bookkeeping and any
     // later `setModel` round-trip stay truthful to what the SDK is running.
-    const resolved = resolveModelPreference(session.modelInfos, switchedModel);
+    const resolved = resolveReportedModel(session.modelInfos, switchedModel);
     const value = resolved?.value ?? switchedModel;
     if (session.models.currentModelId === value) return;
 
@@ -7587,13 +7581,16 @@ export class ClaudeAcpAgent {
     });
   }
 
-  private async getOrCreateSession(params: {
-    sessionId: string;
-    cwd: string;
-    mcpServers?: NewSessionRequest["mcpServers"];
-    additionalDirectories?: NewSessionRequest["additionalDirectories"];
-    _meta?: NewSessionRequest["_meta"];
-  }): Promise<NewSessionResponse> {
+  private async getOrCreateSession(
+    params: {
+      sessionId: string;
+      cwd: string;
+      mcpServers?: NewSessionRequest["mcpServers"];
+      additionalDirectories?: NewSessionRequest["additionalDirectories"];
+      _meta?: NewSessionRequest["_meta"];
+    },
+    resumedSession?: ResumedSessionSnapshot,
+  ): Promise<NewSessionResponse> {
     const existingSession = this.sessions[params.sessionId];
     if (existingSession) {
       const fingerprint = computeSessionFingerprint(params);
@@ -7611,6 +7608,10 @@ export class ClaudeAcpAgent {
       await this.teardownSession(params.sessionId);
     }
 
+    const resumedModelHint = resumedSession
+      ? resumedSession.model
+      : (await readResumedSession(params.sessionId, this.logger)).model;
+
     const response = await this.createSession(
       {
         cwd: params.cwd,
@@ -7620,6 +7621,7 @@ export class ClaudeAcpAgent {
       },
       {
         resume: params.sessionId,
+        resumedModelHint,
       },
     );
 
@@ -7671,8 +7673,13 @@ export class ClaudeAcpAgent {
        *  wrote one; this keeps the ACP session id alive with an empty history.
        *  The SDK accepts a caller-chosen id as long as `resume` is not set. */
       reuseSessionId?: string;
+      /** Concrete model id from the resumed transcript's last real assistant
+       *  message. Claude Code restores from this same record, so it lets us
+       *  report the live model without a slow getContextUsage control request. */
+      resumedModelHint?: string;
     } = {},
   ): Promise<NewSessionResponse> {
+    const createStartedAt = performance.now();
     // Validate `cwd` up front. The ACP spec requires an absolute path, and the
     // directory must actually exist on the machine running the agent. Without
     // this check a session is created against a missing directory and the
@@ -7697,6 +7704,23 @@ export class ClaudeAcpAgent {
     } else {
       sessionId = randomUUID();
     }
+    const timing = new SessionTiming(this.logger, "create", sessionId, createStartedAt);
+    timing.phase("validate-cwd");
+
+    // Most session/load calls already carry a transcript snapshot so history
+    // replay and model restoration share one local read. A few resume paths
+    // intentionally call createSession directly (legacy session/new metadata,
+    // sign-out respawn, provider rerouting), so fill the same fast local hint
+    // here when the caller did not provide it. Never fall back to the slow
+    // getContextUsage control request.
+    let resumedModelHint = creationOpts.resumedModelHint;
+    if (
+      creationOpts.resume !== undefined &&
+      !Object.prototype.hasOwnProperty.call(creationOpts, "resumedModelHint")
+    ) {
+      resumedModelHint = (await readResumedSession(creationOpts.resume, this.logger)).model;
+      timing.phase("resume-transcript");
+    }
 
     const input = new Pushable<SDKUserMessage>();
 
@@ -7704,6 +7728,7 @@ export class ClaudeAcpAgent {
       logger: this.logger,
     });
     await settingsManager.initialize();
+    timing.phase("settings");
 
     const mcpServers: Record<string, McpServerConfig> = {};
     if (Array.isArray(params.mcpServers)) {
@@ -7843,17 +7868,18 @@ export class ClaudeAcpAgent {
             ...(modelConfig.availableModels && { availableModels: modelConfig.availableModels }),
           }
         : undefined);
+    const configuredSettingsObject =
+      typeof configuredSettings === "string"
+        ? (JSON.parse(
+            await fs.readFile(path.resolve(params.cwd, configuredSettings), "utf8"),
+          ) as Settings)
+        : configuredSettings;
     // Claude Code applies env from settings.json after the subprocess env. Put
     // an active ACP route in the programmatic settings tier too so user/project
     // settings cannot silently restore a different ANTHROPIC_BASE_URL.
     let settings = configuredSettings;
     if (resolvedProvider) {
-      const baseSettings =
-        typeof configuredSettings === "string"
-          ? (JSON.parse(
-              await fs.readFile(path.resolve(params.cwd, configuredSettings), "utf8"),
-            ) as Exclude<Options["settings"], string | undefined>)
-          : configuredSettings;
+      const baseSettings = configuredSettingsObject;
       settings = {
         ...baseSettings,
         apiKeyHelper: "",
@@ -7958,7 +7984,7 @@ export class ClaudeAcpAgent {
         // switches the session's model with no refusal-fallback frame, and
         // the client's picker silently drifts. `source: 'sdk'` is the
         // adapter's own setModel (applyConfigOptionValue already synced it),
-        // and 'resume' restores are read back via readResumedLiveModel, so
+        // and 'resume' restores are read from the transcript before startup, so
         // only the remaining sources sync here (CLI 2.1.251+; older CLIs
         // never fire the hook and keep the pre-hook behavior).
         PostModelSwitch: [
@@ -8045,6 +8071,7 @@ export class ClaudeAcpAgent {
       prompt: input,
       options,
     });
+    timing.phase("prepare-query");
 
     // `query()` spawns the CLI at once. Any throw between here and the
     // registration in `this.sessions` would leave that child process running
@@ -8064,6 +8091,7 @@ export class ClaudeAcpAgent {
         }
         throw error;
       }
+      timing.phase("sdk-initialize");
 
       // Publish the identity BEFORE the guard can refuse this session. A
       // refusal is exactly when the client most needs to know which account it
@@ -8107,14 +8135,17 @@ export class ClaudeAcpAgent {
           )
         : initializationResult.models;
 
-      const { modelState: models, resumedContextWindow } = await getAvailableModels(
+      const models = await getAvailableModels(
         q,
         allowedModels,
         initializationResult.models,
         settingsManager,
         this.logger,
         creationOpts.resume !== undefined,
+        sessionId,
+        resumedModelHint,
       );
+      timing.phase("models");
 
       // Resolve the current model's capabilities separately from the stable
       // permission-mode catalog advertised to ACP clients.
@@ -8127,18 +8158,9 @@ export class ClaudeAcpAgent {
       const allowlistedModelInfo = allowedModels.find((m) => m.value === models.currentModelId);
       const fallbackModelInfo = allowlistedModelInfo
         ? undefined
-        : (resolveModelPreference(initializationResult.models, models.currentModelId) ?? undefined);
+        : (resolveReportedModel(initializationResult.models, models.currentModelId) ?? undefined);
       const currentModelInfo = allowlistedModelInfo ?? fallbackModelInfo;
-      // Register the fallback-resolved capabilities under the verbatim live id
-      // so every modelInfos consumer (buildConfigOptions' effort lookup, later
-      // rebuilds via session.modelInfos) agrees with the gating below. The
-      // picker options themselves come from `models.availableModels`, so this
-      // adds no selectable entry. The spread keeps every capability flag
-      // (current and future); the identity fields are overridden because the
-      // fuzzy-matched sibling's resolvedModel/displayName/description can
-      // describe a different context lane and would poison later resolvedModel
-      // matching (syncModelAfterExternalSwitch) and context-window inference
-      // (applyConfigOptionValue) if they traveled under this id.
+      // Keep capabilities reported for a live model outside the selectable allowlist.
       const modelInfos = fallbackModelInfo
         ? [
             ...allowedModels,
@@ -8157,8 +8179,10 @@ export class ClaudeAcpAgent {
         currentModelInfo,
         currentModelId: models.currentModelId,
       });
+      timing.phase("modes");
 
       const agents = await discoverCustomAgents(q);
+      timing.phase("agents");
       // Only adopt the requested agent as the selected value if it's one we
       // actually surface in the picker. A built-in (filtered out above) or
       // otherwise-unknown name would leave the config option's `currentValue`
@@ -8191,54 +8215,30 @@ export class ClaudeAcpAgent {
         disabledReason: fastModeDisabledReason,
       };
 
-      // The Effort picker seed mirrors what the CLI itself resolves from the
-      // persisted settings — the current model's `modelSettings` entry first
-      // (the CLI persists /effort per model), then the legacy top-level value.
-      // Display-only: no applyFlagSettings here. The CLI reads the same
-      // settings, so pinning the seed at the flag layer was always redundant —
-      // and it would override the CLI's own per-model restore on every later
-      // model switch. Only a user's explicit ACP picker choice pins the flag
-      // (see applyConfigOptionValue / Session.effortPinnedByUser).
+      const useRecommendedValue = clientSupportsRecommendedConfigValue(this.clientCapabilities);
       const configOptions = buildConfigOptions(
         modes,
         models,
         modelInfos,
-        settingsEffortForModel(settingsManager.getSettings(), currentModelInfo),
+        userProvidedOptions?.effort ??
+          settingsEffortForModel(
+            mergeEffortSettings(settingsManager.getSettings(), configuredSettingsObject),
+            currentModelInfo,
+          ),
         agents,
         currentAgent,
         fastMode,
+        {
+          useRecommendedValue,
+        },
       );
-      // Seed the context window WITHOUT any extra IPC on the session/new path.
-      // On session/load, the resumed session's own `getContextUsage` report — a
-      // response `getAvailableModels` already awaited to learn the live model
-      // (resumed sessions ARE serviced pre-turn, unlike fresh ones) — is
-      // authoritative and wins. Otherwise: the cached authoritative window if a
-      // prior turn has learned it for this model (`result.modelUsage`,
-      // cross-session), else the text heuristic, else the default. We
-      // deliberately do NOT issue a getContextUsage call here: on a fresh
-      // session that control request is not serviced until the first prompt
-      // turn runs, so awaiting it — as 0.59.0 did — made session/new take ~15s
-      // (issues #886/#880). The authoritative window arrives on the first
-      // `result.modelUsage` and is cached from there.
-      //
-      // Text inference alone misses aliases that resolve to extended-context
-      // models with no "1m" token anywhere in their id or description (e.g.
-      // `sonnet` → claude-sonnet-5, natively ~1M): those stream
-      // `usage_update.size: 200000` until the first result's modelUsage corrects
-      // it — but the cache means only the FIRST session to ever run a turn on such
-      // a model eats that window, not every fresh session after a process
-      // restart (issue #596; a post-restart session/load is covered by the
-      // resumed report above).
-      //
-      // The inference fallback is deliberately keyed to the allowlisted entry: a
-      // fallback-resolved sibling's resolvedModel/displayName/description can
-      // describe a different context lane than the verbatim live id (e.g. an
-      // "opus[1m]" row matched for a bare 200k id), so on the fallback path only
-      // the id itself is a trustworthy window signal.
-      const seededWindow =
-        resumedContextWindow !== null
-          ? { size: resumedContextWindow, authoritative: true }
-          : immediateContextWindow(providerCacheKey, models.currentModelId, allowlistedModelInfo);
+      const initialEffort = configOptions.find((option) => option.id === EFFORT_CONFIG_ID);
+      // Pre-turn getContextUsage blocks the SDK control channel; use prior provider reports.
+      const seededWindow = cachedContextWindow(
+        providerCacheKey,
+        models.currentModelId,
+        allowlistedModelInfo,
+      );
 
       this.sessions[sessionId] = {
         query: q,
@@ -8248,6 +8248,7 @@ export class ClaudeAcpAgent {
         sessionFingerprint: computeSessionFingerprint(params),
         creationParams: params,
         settingsManager,
+        effortSettingsOverride: configuredSettingsObject,
         titles: new SessionTitles(this, sessionId),
         accumulatedUsage: {
           inputTokens: 0,
@@ -8263,6 +8264,11 @@ export class ClaudeAcpAgent {
         autoModeFallbackWarningShown: false,
         autoModeFallbackWarningPending,
         configOptions,
+        effortPinnedLevel:
+          userProvidedOptions?.effort !== undefined &&
+          initialEffort?.currentValue === userProvidedOptions.effort
+            ? userProvidedOptions.effort
+            : undefined,
         agents,
         currentAgent,
         fastModeEnabled,
@@ -8270,8 +8276,7 @@ export class ClaudeAcpAgent {
         abortController,
         emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
         forwardSubagentText,
-        contextWindowSize: seededWindow.size,
-        contextWindowAuthoritative: seededWindow.authoritative,
+        contextWindowSize: seededWindow,
         providerCacheKey,
         taskState,
         toolUseCache: {},
@@ -8290,6 +8295,7 @@ export class ClaudeAcpAgent {
         fileChangeReportRequestIds: new Set(),
         fileChangeAuditSupport,
       };
+      timing.phase("register");
 
       return {
         sessionId,
@@ -8712,45 +8718,6 @@ function isValidBaseUrl(baseUrl: string | undefined): baseUrl is string {
   return parsed.protocol === "http:" || parsed.protocol === "https:";
 }
 
-// Translate a UI effort value into the flag-layer payload. The SDK
-// shallow-merges `applyFlagSettings`, drops `undefined` during JSON transport,
-// and only clears a key when an explicit `null` is sent — see
-// `applyFlagSettings` in @anthropic-ai/claude-agent-sdk. Mapping both the
-// `"default"` sentinel and `undefined` (effort option absent for the model) to
-// `null` ensures any previously-applied flag is actually cleared. Typed as
-// `EffortLevel` (not `Settings["effortLevel"]`): the picker offers whatever
-// `supportedEffortLevels` reports, which includes the session-scoped `"max"`
-// that the persisted Settings shape deliberately excludes.
-function toSdkEffortLevel(value: string | undefined): EffortLevel | null {
-  return value === undefined || value === "default" ? null : (value as EffortLevel);
-}
-
-/** The effort level the CLI itself resolves for a model from the persisted
- *  settings: the per-model entry (`modelSettings`, keyed by canonical model
- *  name — the CLI persists /effort per model since 2.1.243) wins over the
- *  legacy top-level `effortLevel`. Alias picker rows are looked up by their
- *  resolved model id first, then the row value, then the raw config value
- *  for models not in the picker. Exact keys only — the CLI's canonical-form
- *  fallback matching isn't replicated, so a miss simply falls back to the
- *  top-level value (best-effort display; `buildConfigOptions` still
- *  validates the result against the model's supported levels). */
-export function settingsEffortForModel(
-  settings: Settings,
-  modelInfo: ModelInfo | undefined,
-  modelId?: string,
-): string | undefined {
-  const modelSettings = settings.modelSettings;
-  if (modelSettings) {
-    for (const key of [modelInfo?.resolvedModel, modelInfo?.value, modelId]) {
-      const perModel = key !== undefined ? modelSettings[key]?.effortLevel : undefined;
-      if (typeof perModel === "string") {
-        return perModel;
-      }
-    }
-  }
-  return settings.effortLevel;
-}
-
 // `supportedAgents()` always returns Claude Code's built-in subagents — the
 // ones used for Task-tool delegation (Explore, Plan, etc.) — even when the user
 // has configured none of their own. Those aren't meaningful *main-thread*
@@ -8788,7 +8755,6 @@ export async function discoverCustomAgents(q: Query): Promise<AgentInfo[]> {
  *  handlers in `setSessionConfigOption`/`applyConfigOptionValue` reference the
  *  same identifiers and can't drift apart. */
 export { MODE_CONFIG_ID };
-export const MODEL_CONFIG_ID = "model";
 export const AGENT_CONFIG_ID = "agent";
 export const FAST_MODE_CONFIG_ID = "fast";
 
@@ -8844,6 +8810,15 @@ export function clientSupportsBooleanConfigOptions(
   clientCapabilities?: ClientCapabilities | null,
 ): boolean {
   return clientCapabilities?.session?.configOptions?.boolean != null;
+}
+
+/** Whether the Client advertised the AIR `recommendedValue` capability for
+ *  select-style model and effort options. Missing or malformed AIR metadata
+ *  retains the legacy `default` entries. */
+export function clientSupportsRecommendedConfigValue(
+  clientCapabilities?: ClientCapabilities | null,
+): boolean {
+  return clientSupportsAirCapability(clientCapabilities, AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY);
 }
 
 /** Build the Fast mode config option. When the Client supports boolean config
@@ -8915,6 +8890,11 @@ export type FastModeOptionState = {
   disabledReason?: FastModeDisabledReason;
 };
 
+export type ConfigOptionPresentation = {
+  /** Advertise concrete defaults resolved by the SDK. */
+  useRecommendedValue: boolean;
+};
+
 export function buildConfigOptions(
   modes: SessionModeState,
   models: SessionModelState,
@@ -8923,68 +8903,14 @@ export function buildConfigOptions(
   agents: AgentInfo[] = [],
   currentAgent: string = DEFAULT_AGENT_ID,
   fastMode?: FastModeOptionState,
+  presentation?: ConfigOptionPresentation,
 ): SessionConfigOption[] {
   const options: SessionConfigOption[] = [
     SessionModeManager.configOption(modes),
-    {
-      id: MODEL_CONFIG_ID,
-      name: "Model",
-      description: "AI model to use",
-      category: "model",
-      type: "select",
-      currentValue: models.currentModelId,
-      options: models.availableModels.map((m) => {
-        if (m.modelId === "default") {
-          const defaultInfo = modelInfos.find((mi) => mi.value === "default");
-          const resolvedModel = defaultInfo?.resolvedModel;
-          if (resolvedModel) {
-            const namedMatch = modelInfos.find(
-              (mi) => mi.value !== "default" && mi.resolvedModel === resolvedModel,
-            );
-            return {
-              value: m.modelId,
-              name: m.name,
-              description: namedMatch?.displayName ?? resolvedModel,
-            };
-          }
-        }
-        return { value: m.modelId, name: m.name, description: m.description ?? undefined };
-      }),
-    },
+    buildModelConfigOption(models, modelInfos, presentation?.useRecommendedValue === true),
   ];
-
-  // Add effort level option based on the currently selected model
-  const currentModelInfo = modelInfos.find((m) => m.value === models.currentModelId);
-  const supportedLevels = currentModelInfo?.supportsEffort
-    ? (currentModelInfo.supportedEffortLevels ?? [])
-    : [];
-
-  if (supportedLevels.length > 0) {
-    const effortOptions = [
-      { value: "default", name: "Default" },
-      ...supportedLevels.map((level) => ({
-        value: level,
-        name: level
-          .split(/[_-]/)
-          .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
-          .join(" "),
-      })),
-    ];
-
-    const includes = (l: string) => l === "default" || (supportedLevels as string[]).includes(l);
-    const validEffort =
-      currentEffortLevel && includes(currentEffortLevel) ? currentEffortLevel : "default";
-
-    options.push({
-      id: EFFORT_CONFIG_ID,
-      name: "Effort",
-      description: "Available effort levels for this model",
-      category: "thought_level",
-      type: "select",
-      currentValue: validEffort,
-      options: effortOptions,
-    });
-  }
+  const effort = buildEffortConfigOption(modelInfos, models.currentModelId, currentEffortLevel);
+  if (effort) options.push(effort);
 
   // Surface the Fast mode toggle only when the current model supports it. The
   // option renders as a native boolean toggle for Clients that opted in, and a
@@ -9022,455 +8948,6 @@ export function buildConfigOptions(
   }
 
   return options;
-}
-
-// Claude Code CLI persists display strings like "opus[1m]" in settings,
-// but the SDK model list uses IDs like "claude-opus-4-6-1m".
-const MODEL_CONTEXT_HINT_PATTERN = /\[(\d+m)\]$/i;
-
-// The id-suffix spelling of a context hint ("-1m" in "claude-opus-4-6-1m");
-// shared by the strip and canonicalize helpers below so the two can't drift.
-const CONTEXT_HINT_SUFFIX_PATTERN = /-(\d+m)$/i;
-
-/** Remove context-window hints — the display form "[1m]" and the SDK id
- *  suffix form "-1m" — from a model string. Those digits describe context
- *  size, not model identity or generation version. */
-function stripContextHints(s: string): string {
-  return s.replace(/\[\d+m\]/gi, "").replace(CONTEXT_HINT_SUFFIX_PATTERN, "");
-}
-
-/** Canonicalize a model id for exact comparison: trimmed, lowercased, with
- *  the id-suffix hint spelling unified to the bracket form ("-1m" → "[1m]").
- *  The hint itself is kept — bare and 1M ids must stay distinct. */
-function canonicalizeModelId(s: string): string {
-  return s.trim().toLowerCase().replace(CONTEXT_HINT_SUFFIX_PATTERN, "[$1]");
-}
-
-/** The context hint a model string carries ("1m" for either spelling), or
- *  null for a bare id. */
-function contextHintOf(s: string): string | null {
-  return canonicalizeModelId(s).match(MODEL_CONTEXT_HINT_PATTERN)?.[1] ?? null;
-}
-
-// Captures a model family version: `4-6`/`4.7` for dated generations, or a
-// bare `5` for single-number ones like "Sonnet 5". Used to keep a pinned
-// `claude-opus-4-6` from matching the `opus` alias once it points at 4.7.
-const MODEL_FAMILY_VERSION_PATTERN = /\b(\d+)(?:[-.](\d+))?\b/;
-
-function extractModelFamilyVersion(s: string): string | null {
-  const match = stripContextHints(s).match(MODEL_FAMILY_VERSION_PATTERN);
-  if (!match) return null;
-  return match[2] ? `${match[1]}.${match[2]}` : match[1];
-}
-
-function modelVersionsCompatible(preference: string, candidate: ModelInfo): boolean {
-  const preferred = extractModelFamilyVersion(preference);
-  if (!preferred) return true;
-  const candidateVersion =
-    extractModelFamilyVersion(candidate.value) ??
-    extractModelFamilyVersion(candidate.displayName) ??
-    extractModelFamilyVersion(candidate.description);
-  if (!candidateVersion) return true;
-  return preferred === candidateVersion;
-}
-
-function tokenizeModelPreference(model: string): { tokens: string[]; contextHint?: string } {
-  const lower = model.trim().toLowerCase();
-  const contextHint = lower.match(MODEL_CONTEXT_HINT_PATTERN)?.[1]?.toLowerCase();
-
-  const normalized = lower.replace(MODEL_CONTEXT_HINT_PATTERN, " $1 ");
-  const rawTokens = normalized.split(/[^a-z0-9]+/).filter(Boolean);
-  const tokens = rawTokens
-    .map((token) => {
-      if (token === "opusplan") return "opus";
-      if (token === "best" || token === "default") return "";
-      return token;
-    })
-    .filter((token) => token && token !== "claude")
-    .filter((token) => /[a-z]/.test(token) || token.endsWith("m"));
-
-  return { tokens, contextHint };
-}
-
-function scoreModelMatch(model: ModelInfo, tokens: string[], contextHint?: string): number {
-  const haystack = `${model.value} ${model.displayName}`.toLowerCase();
-  let score = 0;
-  let nonHintMatched = false;
-  for (const token of tokens) {
-    if (haystack.includes(token)) {
-      if (token !== contextHint) nonHintMatched = true;
-      score += token === contextHint ? 3 : 1;
-    }
-  }
-  if (contextHint && !nonHintMatched) return 0;
-  return score;
-}
-
-export function resolveModelPreference(models: ModelInfo[], preference: string): ModelInfo | null {
-  const trimmed = preference.trim();
-  if (!trimmed) return null;
-
-  const lower = trimmed.toLowerCase();
-
-  // Exact match on value or display name. Values compare on the canonical
-  // hint spelling so "opus-1m" hits an "opus[1m]" row (and vice versa).
-  const canonicalPreference = canonicalizeModelId(trimmed);
-  const directMatch = models.find(
-    (model) =>
-      model.value === trimmed ||
-      canonicalizeModelId(model.value) === canonicalPreference ||
-      model.displayName.toLowerCase() === lower,
-  );
-  if (directMatch) return directMatch;
-
-  // Exact match on the alias's canonical resolved id (e.g. a pinned
-  // "claude-sonnet-5" against the "sonnet" row's `resolvedModel`). SDK-
-  // reported and unambiguous, so it's tried before the fuzzier tiers below.
-  // Compared on the canonical hint spelling so a "-1m"-suffix pin matches a
-  // "[1m]"-spelled resolvedModel instead of falling into the substring tier
-  // (which would land on the bare 200k sibling). "default" is skipped first
-  // since it shares a resolvedModel with whichever alias the CLI currently
-  // recommends — a specific pin should land on that named alias, not
-  // "default".
-  const matchesResolved = (model: ModelInfo) =>
-    model.resolvedModel != null && canonicalizeModelId(model.resolvedModel) === canonicalPreference;
-  const resolvedMatch =
-    models.find((model) => model.value !== "default" && matchesResolved(model)) ??
-    models.find(matchesResolved);
-  if (resolvedMatch) return resolvedMatch;
-
-  // Substring match. Skips candidates whose context hint disagrees with the
-  // preference's — a bare row must not absorb a 1M-hinted preference (nor
-  // vice versa); such pairs fall through to the tokenized tier, which
-  // weighs hints in its scoring and still finds the best same-family row.
-  const preferenceHint = contextHintOf(trimmed);
-  const includesMatch = models.find((model) => {
-    if (!modelVersionsCompatible(trimmed, model)) return false;
-    if (contextHintOf(model.value) !== preferenceHint) return false;
-    const value = model.value.toLowerCase();
-    const display = model.displayName.toLowerCase();
-    return value.includes(lower) || display.includes(lower) || lower.includes(value);
-  });
-  if (includesMatch) return includesMatch;
-
-  // Tokenized matching for aliases like "opus[1m]"
-  const { tokens, contextHint } = tokenizeModelPreference(trimmed);
-  if (tokens.length === 0) return null;
-
-  let bestMatch: ModelInfo | null = null;
-  let bestScore = 0;
-  for (const model of models) {
-    if (!modelVersionsCompatible(trimmed, model)) continue;
-    const score = scoreModelMatch(model, tokens, contextHint);
-    if (0 < score && (!bestMatch || bestScore < score)) {
-      bestMatch = model;
-      bestScore = score;
-    }
-  }
-
-  return bestMatch;
-}
-
-/** Map the live model reported by a resumed session onto the picker's model
- *  list. The CLI restores a resumed session's model from the transcript's
- *  last assistant message, which records the concrete API id (e.g.
- *  "claude-opus-4-6") with any "[1m]" context hint dropped. Tiers, in order:
- *  1. Exact match with the Default entry's resolution — when a named alias
- *     shares Default's resolvedModel verbatim, the live id can't tell the
- *     two apart, and a never-customized session should stay on Default.
- *  2. Exact resolvedModel match on a named row. Checked before the
- *     hint-stripped Default comparison so a live "claude-sonnet-5[1m]" lands
- *     on the "sonnet[1m]" row rather than a Default that resolves to the
- *     bare "claude-sonnet-5" — the two rows differ in context window, which
- *     drives `contextWindowSize` and capability gating downstream.
- *  3. Hint-stripped match with Default's resolution — a session that never
- *     left the default resumes as the bare transcript id, and shouldn't show
- *     a concrete picker entry.
- *  4. `resolveModelPreference` over the picker entries.
- *  5. A model with no picker counterpart (e.g. excluded by an
- *     `availableModels` allowlist) is tracked verbatim, mirroring
- *     `syncModelAfterExternalSwitch`: the picker shows no selection, but the
- *     model-dependent bookkeeping stays truthful to what the SDK is running. */
-export function matchResumedModel(models: ModelInfo[], liveModel: string): ModelInfo {
-  const live = canonicalizeModelId(liveModel);
-  const defaultEntry = models.find((m) => m.value === "default");
-  const defaultResolved = defaultEntry?.resolvedModel
-    ? canonicalizeModelId(defaultEntry.resolvedModel)
-    : undefined;
-
-  if (defaultEntry && defaultResolved === live) {
-    return defaultEntry;
-  }
-
-  // No default-row exclusion needed: a default row matching `live` exactly
-  // already returned at the tier above.
-  const exactMatch = models.find(
-    (m) => m.resolvedModel && canonicalizeModelId(m.resolvedModel) === live,
-  );
-  if (exactMatch) return exactMatch;
-
-  if (
-    defaultEntry &&
-    defaultResolved &&
-    stripContextHints(defaultResolved) === stripContextHints(live)
-  ) {
-    return defaultEntry;
-  }
-
-  return (
-    resolveModelPreference(models, liveModel) ?? {
-      value: liveModel,
-      displayName: liveModel,
-      description: "",
-    }
-  );
-}
-
-function resolveSettingsModel(
-  models: ModelInfo[],
-  settingsModel: unknown,
-  logger: Logger,
-): ModelInfo | null {
-  if (settingsModel === undefined) {
-    return null;
-  }
-  if (typeof settingsModel !== "string") {
-    const typeLabel = settingsModel === null ? "null" : typeof settingsModel;
-    logger.error(`Ignoring model from settings: expected a string, got ${typeLabel}.`);
-    return null;
-  }
-  return resolveModelPreference(models, settingsModel);
-}
-
-/**
- * Restrict the SDK's model list to the user's `availableModels` allowlist
- * (already merged-and-deduped across settings sources by `SettingsManager`).
- * The user's exact entries become the model IDs surfaced via configOptions
- * and passed to `setModel`, which prevents Claude Code from silently
- * substituting a date-pinned variant (e.g. `haiku` →
- * `claude-haiku-4-5-20251001`) that the user may not have access to.
- *
- * Display info and capability flags are copied from the closest SDK match so
- * the UI still renders sensible names and effort levels.
- *
- * Semantics from https://code.claude.com/docs/en/model-config#restrict-model-selection:
- * - `undefined` is handled by the caller (no allowlist applied).
- * - The Default option is unaffected by `availableModels` — it always remains
- *   available, even when the allowlist is `[]`.
- */
-export function applyAvailableModelsAllowlist(
-  sdkModels: ModelInfo[],
-  allowlist: string[],
-  settingsModelOverrides?: Record<string, string>,
-): ModelInfo[] {
-  // Default is always preserved per the docs. Synthesize one if the SDK
-  // didn't surface it so downstream code (e.g. `getAvailableModels` picking
-  // `models[0]` as a fallback) still has something to work with.
-  const defaultModel = sdkModels.find((m) => m.value === "default") ?? {
-    value: "default",
-    displayName: "Default",
-    description: "",
-  };
-  const result: ModelInfo[] = [defaultModel];
-  const seen = new Set<string>([defaultModel.value]);
-
-  const sdkModelsWithoutDefault = sdkModels.filter((m) => m.value !== "default");
-
-  // Bedrock/Vertex deployments enforce short aliases (e.g. "claude-opus-4-6")
-  // in availableModels but require provider-specific IDs at the API. We still
-  // resolve `sdkMatch` against the alias (`trimmed`) — that's what the
-  // matching heuristics above are built for, and override targets (ARNs,
-  // opaque provider IDs) often won't textually resemble anything in
-  // `sdkModelsWithoutDefault`. Only the entry's surfaced `value` becomes the
-  // override target, so it's what `setModel` ends up passing to the API.
-  for (const entry of allowlist) {
-    const trimmed = entry.trim();
-    if (!trimmed || seen.has(trimmed)) continue;
-
-    const overridden = settingsModelOverrides?.[trimmed];
-    const effective = overridden ?? trimmed;
-    if (seen.has(effective)) continue;
-
-    const sdkMatch = resolveModelPreference(sdkModelsWithoutDefault, trimmed);
-    if (sdkMatch) {
-      result.push({ ...sdkMatch, value: effective });
-    } else {
-      result.push({ value: effective, displayName: trimmed, description: "" });
-    }
-    seen.add(effective);
-  }
-
-  // The custom model option (ANTHROPIC_CUSTOM_MODEL_OPTION) is exempt from the
-  // allowlist, the same way Default is. Per the model-config docs it adds an
-  // entry "without replacing the built-in aliases" and "appears at the bottom of
-  // the /model picker", so we append it last and skip the allowlist filter; this
-  // keeps a slim alias allowlist from hiding the custom model row.
-  // https://code.claude.com/docs/en/model-config#add-a-custom-model-option
-  const customModelOption = process.env.ANTHROPIC_CUSTOM_MODEL_OPTION?.trim();
-  if (customModelOption && !seen.has(customModelOption)) {
-    const customModel = sdkModels.find((m) => m.value === customModelOption);
-    if (customModel) {
-      result.push(customModel);
-      seen.add(customModel.value);
-    }
-  }
-
-  return result;
-}
-
-/** Read the model a resumed session is actually running (via the
- *  `getContextUsage` control request — the same source `/context` prints) and
- *  map it onto the picker, along with the report's authoritative context
- *  window (`rawMaxTokens`). Resumed sessions get this request serviced before
- *  any turn runs in the new process — unlike fresh sessions, where it stalls
- *  until the first prompt turn (issues #886/#880) — so the same response that
- *  restores the live model (issue #845) also seeds the window for free,
- *  covering post-restart reloads of models the text heuristic misses (issue
- *  #596). Best-effort: a control-request failure is logged and returns nulls
- *  so callers keep their current choice; failing the whole session/load over
- *  an unreadable report would be worse. */
-/** Whether a rejected `setModel` was vetoed by a user-configured
- *  PreModelSwitch hook. The CLI's rejection message is the stable,
- *  distinguishable marker ("Model switch blocked by a PreModelSwitch hook:
- *  <reason>"); a format change makes this stop matching and the failure
- *  falls back to the ordinary fail-loud path, no worse than before. */
-function isPreModelSwitchHookBlock(error: unknown): boolean {
-  return error instanceof Error && error.message.includes("blocked by a PreModelSwitch hook");
-}
-
-async function readResumedLiveModel(
-  query: Query,
-  models: ModelInfo[],
-  logger: Logger,
-): Promise<{ model: ModelInfo | null; contextWindow: number | null }> {
-  try {
-    const usage = await query.getContextUsage();
-    return {
-      model: usage.model ? matchResumedModel(models, usage.model) : null,
-      contextWindow: usage.rawMaxTokens > 0 ? usage.rawMaxTokens : null,
-    };
-  } catch (error) {
-    logger.error("Failed to read the resumed session's live model:", error);
-    return { model: null, contextWindow: null };
-  }
-}
-
-async function getAvailableModels(
-  query: Query,
-  models: ModelInfo[],
-  sdkModels: ModelInfo[],
-  settingsManager: SettingsManager,
-  logger: Logger,
-  isResumedSession: boolean,
-): Promise<{ modelState: SessionModelState; resumedContextWindow: number | null }> {
-  const settings = settingsManager.getSettings();
-
-  let currentModel = models[0];
-  let resolvedFromInput: string | undefined;
-  // The context window reported alongside a resumed session's live model.
-  // Only ever non-null on the paths where `currentModel` IS the live model
-  // (no override, or a failed override re-assert), so the window always
-  // describes the model the session actually runs.
-  let resumedContextWindow: number | null = null;
-
-  // Model priority (highest to lowest):
-  // 1. ANTHROPIC_MODEL environment variable
-  // 2. settings.model (user configuration)
-  // 3. the resumed session's live model (resumed sessions only)
-  // 4. models[0] (default first model)
-  if (process.env.ANTHROPIC_MODEL) {
-    const match = resolveModelPreference(models, process.env.ANTHROPIC_MODEL);
-    if (match) {
-      currentModel = match;
-      resolvedFromInput = process.env.ANTHROPIC_MODEL;
-    }
-  } else if (typeof settings.model === "string") {
-    const match = resolveSettingsModel(models, settings.model, logger);
-    if (match) {
-      currentModel = match;
-      resolvedFromInput = settings.model;
-    }
-  }
-
-  // A resumed session restores the model it was previously running (the CLI
-  // re-reads it from the transcript), so without an env/settings override the
-  // freshly-computed default above can disagree with what the session actually
-  // runs — session/load then reports a model the session isn't using (issue
-  // #845). Ask the CLI for the live model and reflect it. No `setModel` here:
-  // the SDK is already running this model, and pushing a picker alias back
-  // (e.g. "opus[1m]") could change the live model rather than describe it.
-  if (resolvedFromInput === undefined && isResumedSession) {
-    const live = await readResumedLiveModel(query, models, logger);
-    currentModel = live.model ?? currentModel;
-    resumedContextWindow = live.contextWindow;
-  }
-
-  // Skip the setModel round-trip when we can prove the SDK has already landed
-  // on the same model. Two cases qualify:
-  //  (a) No override applied — currentModel is the SDK's own default (or, on
-  //      resume, the live model read back from the SDK above); nothing to sync.
-  //  (b) The resolver returned the user's input verbatim AND that value exists
-  //      in the SDK's original model list — meaning no fuzzy match or
-  //      allowlist rewrite was involved, and the SDK (which reads the same
-  //      ANTHROPIC_MODEL / settings.json) will have arrived at the same entry.
-  //      This only holds for fresh sessions: a resumed session lands on the
-  //      transcript's model regardless of env/settings, so the override must
-  //      be re-asserted to keep the reported model truthful.
-  // Anything else (fuzzy match, allowlist-synthesized value, alias) gets a
-  // setModel call so we don't drift from the user's intended pin.
-  const sdkSawSameValue = sdkModels.some((m) => m.value === currentModel.value);
-  const skipSetModel =
-    resolvedFromInput === undefined ||
-    (!isResumedSession && currentModel.value === resolvedFromInput && sdkSawSameValue);
-  if (!skipSetModel) {
-    try {
-      await query.setModel(currentModel.value);
-    } catch (error) {
-      // On a fresh session the pin is a defining option — fail loudly. A
-      // resumed session already runs fine on the transcript's model, so
-      // failing the whole session/load over the re-assert would be worse
-      // than loading with the pin unapplied (mirrors the setPermissionMode
-      // containment in createSession). The SDK then stayed on the
-      // transcript's model, so read that back rather than reporting the
-      // pin the session isn't running.
-      //
-      // One fresh-session failure is advisory, not defining: a
-      // user-configured PreModelSwitch hook can veto the pin (CLI 2.1.251+;
-      // 'deny', or 'ask' — which headless sessions refuse), and the SDK
-      // rejects setModel with "Model switch blocked by a PreModelSwitch
-      // hook: …". Terminal Claude Code never lets a hook veto its startup
-      // model (the spawn model isn't a switch), so failing session/new here
-      // would make the same hook config fatal only over ACP. The session
-      // stays on the SDK's own default — report that. We can't read the
-      // live model back on this path: getContextUsage isn't serviced on a
-      // fresh session until the first prompt turn (issues #886/#880).
-      if (!isResumedSession) {
-        if (!isPreModelSwitchHookBlock(error)) throw error;
-        logger.error(
-          `Model pin "${currentModel.value}" was vetoed by a PreModelSwitch hook; staying on the default model:`,
-          error,
-        );
-        currentModel = models[0];
-      } else {
-        logger.error(`Failed to re-assert model "${currentModel.value}" on resume:`, error);
-        const live = await readResumedLiveModel(query, models, logger);
-        currentModel = live.model ?? currentModel;
-        resumedContextWindow = live.contextWindow;
-      }
-    }
-  }
-
-  return {
-    modelState: {
-      availableModels: models.map((model) => ({
-        modelId: model.value,
-        name: model.displayName,
-        description: model.description,
-      })),
-      currentModelId: currentModel.value,
-    },
-    resumedContextWindow,
-  };
 }
 
 function getAvailableSlashCommands(
@@ -10581,52 +10058,6 @@ export function runAcp(logger?: Logger) {
   return { connection, agent };
 }
 
-function commonPrefixLength(a: string, b: string) {
-  let i = 0;
-  while (i < a.length && i < b.length && a[i] === b[i]) {
-    i++;
-  }
-  return i;
-}
-
-/** Best-effort first guess of a model's context window, used to seed the
- *  window synchronously (via `immediateContextWindow`) until a `result` message
- *  arrives with the authoritative `modelUsage` value.
- *
- *  Anthropic 1M-context variants encode "1m" as a distinct token in the SDK
- *  model ID (e.g., "claude-opus-4-6-1m"), which `\b1m\b` catches without also
- *  matching things like "10m" or embedded substrings. Semantic aliases like
- *  `default` carry no such token in the ID, but their `resolvedModel` and the
- *  SDK's human-facing `displayName`/`description` can (e.g.
- *  "claude-opus-4-8[1m]", "Opus 4.7 (1M context)"), so callers pass those too.
- *  This text scan can't catch every model — some resolve to extended-context
- *  models with no "1m" anywhere (e.g. `sonnet` → claude-sonnet-5, natively
- *  ~1M). Such a miss falls back to the default window and is corrected by
- *  `result.modelUsage` (and cached) within one turn. We do NOT consult the
- *  SDK's `getContextUsage` to close that gap: on a fresh session it is not
- *  serviced before the first prompt turn (issues #886/#880, see
- *  `contextWindowCache`; resumed sessions do get it, via
- *  `readResumedLiveModel`). */
-function inferContextWindowFromModel(...texts: Array<string | undefined>): number | null {
-  if (texts.some((text) => text != null && /\b1m\b/i.test(text))) return 1_000_000;
-  return null;
-}
-
-/** Fetch the SDK's authoritative context-window occupancy via the
- *  `getContextUsage` control request. Unlike the per-message API usage numbers
- *  (which only count message tokens), this `totalTokens` includes the system
- *  prompt, tool schemas, MCP tools, and memory-file overhead — the real
- *  occupancy the user sees. Returns `null` on any control-request failure. */
-async function fetchContextUsedTokens(query: Query, logger: Logger): Promise<number | null> {
-  try {
-    const usage = await query.getContextUsage();
-    return usage.totalTokens;
-  } catch (error) {
-    logger.error("Failed to fetch context usage from SDK:", error);
-    return null;
-  }
-}
-
 /** Cross-session cache of authoritative context windows, keyed by
  *  `${providerCacheKey}\0${modelId}` (see {@link contextWindowCacheKey}).
  *  The window is a property of (model id, backend): the same resolved model id
@@ -10647,9 +10078,6 @@ async function fetchContextUsedTokens(query: Query, logger: Logger): Promise<num
  *  has run the control request is not serviced (it stalls ~15s, and serializes
  *  ahead of an awaited `setModel` — issues #886/#880, regressed in 0.59.0), so
  *  it can neither beat the first `result` nor be issued cheaply before one.
- *  Resumed sessions are the exception — their report IS serviced pre-turn, and
- *  the session/load path seeds (but does not cache) the window from the same
- *  response that restores the live model, see `readResumedLiveModel`.
  *  Cleared on `logout`: 1M-context entitlement can differ per account/tier, so
  *  windows learned under one login must not seed sessions under the next. */
 const contextWindowCache = new Map<string, number>();
@@ -10685,7 +10113,7 @@ const PROVIDER_ROUTING_ENV_VARS = [
  *  Header/credential values can be secrets; the key only ever lives as an
  *  in-memory Map key and is never logged or surfaced. Over-keying is the safe
  *  side: a var change that didn't really change the backend costs one cache
- *  miss (heuristic seed until the next result), while under-keying would serve
+ *  miss (unknown until the next result), while under-keying would serve
  *  one backend's window for another's. */
 function providerCacheKeyFor(env: Record<string, string | undefined>): string {
   return PROVIDER_ROUTING_ENV_VARS.map((name) => env[name] ?? "").join("\0");
@@ -10704,34 +10132,16 @@ function cacheContextWindow(modelKey: string, window: number): void {
   }
 }
 
-/** The context window to report *right now* for a model, with NO IPC on the
- *  critical path: the cached authoritative value if we've learned it (from a
- *  prior turn's `result.modelUsage`, this or any session on the same backend),
- *  else the text heuristic over the model row's identity strings, else the
- *  default. Derives the cache key itself — `modelInfo?.resolvedModel ?? modelId`,
- *  the same rule at every seed site — so read keys can't drift from the write
- *  site's spelling. `authoritative` reports whether the value came from the
- *  cache: an authoritative window can legitimately equal
- *  DEFAULT_CONTEXT_WINDOW, so the value alone can't tell the caller. */
-function immediateContextWindow(
+function cachedContextWindow(
   providerCacheKey: string,
   modelId: string,
-  modelInfo?: Pick<ModelInfo, "resolvedModel" | "displayName" | "description">,
-): { size: number; authoritative: boolean } {
-  const cached = contextWindowCache.get(
-    contextWindowCacheKey(providerCacheKey, modelInfo?.resolvedModel ?? modelId),
+  modelInfo?: Pick<ModelInfo, "resolvedModel">,
+): number {
+  return (
+    contextWindowCache.get(
+      contextWindowCacheKey(providerCacheKey, modelInfo?.resolvedModel ?? modelId),
+    ) ?? 0
   );
-  if (cached !== undefined) return { size: cached, authoritative: true };
-  return {
-    size:
-      inferContextWindowFromModel(
-        modelId,
-        modelInfo?.resolvedModel,
-        modelInfo?.displayName,
-        modelInfo?.description,
-      ) ?? DEFAULT_CONTEXT_WINDOW,
-    authoritative: false,
-  };
 }
 
 /** Translate the legacy `MAX_THINKING_TOKENS` env var into the SDK's `thinking`
@@ -10768,24 +10178,16 @@ function parseModelConfig(
 }
 
 function getMatchingModelUsage(modelUsage: Record<string, ModelUsage>, currentModel: string) {
-  let bestKey: string | null = null;
-  let bestLen = 0;
-
-  for (const key of Object.keys(modelUsage)) {
-    const len = commonPrefixLength(key, currentModel);
-    if (len > bestLen) {
-      bestLen = len;
-      bestKey = key;
-    }
+  if (Object.hasOwn(modelUsage, currentModel)) {
+    return { key: currentModel, usage: modelUsage[currentModel] };
   }
-
-  if (bestKey) {
-    // `bestKey` is the SDK's resolved model id (e.g. "claude-sonnet-5[1m]"),
-    // the same spelling as ModelInfo.resolvedModel — the primary key the
-    // window is cached under. `currentModel` (the assistant message's
-    // `.model`) can be the bare form (e.g. "claude-sonnet-5"); the result
-    // handler caches under that spelling too, for seed-time reads that fall
-    // back to a bare id (rows without `resolvedModel`).
-    return { key: bestKey, usage: modelUsage[bestKey] };
+  // The SDK can decorate the same model with a date or extended-context suffix.
+  const canonical = (model: string) => model.replace(/\[1m\]$/, "").replace(/-\d{8}$/, "");
+  const matches = Object.keys(modelUsage).filter(
+    (key) => canonical(key) === canonical(currentModel),
+  );
+  if (matches.length === 1) {
+    const key = matches[0];
+    return { key, usage: modelUsage[key] };
   }
 }

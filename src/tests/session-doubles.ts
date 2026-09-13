@@ -80,7 +80,6 @@ export function mockSessionState(
     emitRawSDKMessages: false,
     forwardSubagentText: false,
     contextWindowSize: 200000,
-    contextWindowAuthoritative: false,
     providerCacheKey: "default",
     taskState: new Map(),
     toolUseCache: {},
