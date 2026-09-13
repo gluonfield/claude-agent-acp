@@ -1,4 +1,9 @@
 import {
+  MCP_REFRESH_METHOD,
+  parseMcpRefreshRequest,
+  type McpRefreshRequest,
+} from "./mcp-refresh.js";
+import {
   agent as acpAgent,
   AgentContext,
   AuthenticateRequest,
@@ -1925,6 +1930,17 @@ export class ClaudeAcpAgent {
     });
   }
 
+  async refreshMcpServers(params: McpRefreshRequest): Promise<Record<string, never>> {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
+      throw RequestError.invalidParams(undefined, `Unknown session: ${params.sessionId}`);
+    }
+    for (const name of params.serverNames) {
+      await session.query.reconnectMcpServer(name);
+    }
+    return {};
+  }
+
   async initialize(request: InitializeRequest): Promise<InitializeResponse> {
     this.clientCapabilities = request.clientCapabilities;
 
@@ -2056,6 +2072,7 @@ export class ClaudeAcpAgent {
       protocolVersion: 1,
       agentCapabilities: {
         _meta: {
+          mcpRefresh: { method: MCP_REFRESH_METHOD },
           claudeCode: {
             promptQueueing: true,
           },
@@ -10041,6 +10058,11 @@ export function runAcp(logger?: Logger) {
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
     .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
       agent.steer(ctx.params),
+    )
+    .onRequest<McpRefreshRequest, Record<string, never>>(
+      MCP_REFRESH_METHOD,
+      { parse: parseMcpRefreshRequest },
+      (ctx) => agent.refreshMcpServers(ctx.params),
     )
     .onRequest<AsyncTaskStopRequest, AsyncTaskStopResponse>(
       ASYNC_TASK_STOP_METHOD,

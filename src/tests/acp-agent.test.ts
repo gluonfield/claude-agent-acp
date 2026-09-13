@@ -18851,3 +18851,27 @@ describe("permission_denied", () => {
     expect(denials(updates)).toHaveLength(1);
   });
 });
+
+describe("MCP catalog refresh", () => {
+  it("reconnects the requested servers on the existing native query", async () => {
+    const agent = new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+    const reconnectMcpServer = vi.fn(async (_name: string) => {});
+    const session = mockSessionState({ query: { reconnectMcpServer } });
+    agent.sessions["refresh-session"] = session;
+    await expect(
+      agent.refreshMcpServers({ sessionId: "refresh-session", serverNames: ["jaz_mcp"] }),
+    ).resolves.toEqual({});
+    expect(reconnectMcpServer).toHaveBeenCalledExactlyOnceWith("jaz_mcp");
+    expect(agent.sessions["refresh-session"]).toBe(session);
+    reconnectMcpServer.mockRejectedValueOnce(new Error("reconnect failed"));
+    await expect(
+      agent.refreshMcpServers({ sessionId: "refresh-session", serverNames: ["jaz_mcp"] }),
+    ).rejects.toThrow("reconnect failed");
+    await expect(
+      agent.refreshMcpServers({ sessionId: "missing", serverNames: ["jaz_mcp"] }),
+    ).rejects.toThrow("Unknown session");
+  });
+});
