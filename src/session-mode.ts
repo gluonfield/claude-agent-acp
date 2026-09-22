@@ -12,13 +12,25 @@ import type {
   PermissionResult,
   Query,
 } from "@anthropic-ai/claude-agent-sdk";
-import { ALLOW_BYPASS } from "./permissions/modes.js";
+import {
+  noticeOrTranscriptUpdate,
+  noticeTranscriptText,
+  sentenceCase,
+  type SessionNotice,
+} from "./session-notices.js";
 
 export const MODE_CONFIG_ID = "mode";
 export const AUTO_MODE_FALLBACK: PermissionMode = "acceptEdits";
 
-const AUTO_MODE_FALLBACK_NOTICE =
-  "**Auto mode unavailable:** the selected model does not support Auto mode; using Accept edits instead.";
+/** Reads on after the bold label in the transcript line; capitalized when it
+ *  stands alone as a notice description. */
+const AUTO_MODE_FALLBACK_REASON =
+  "the selected model does not support Auto mode; using Accept edits instead.";
+const AUTO_MODE_FALLBACK_NOTICE: SessionNotice = {
+  severity: "warning",
+  title: "Auto mode unavailable",
+  description: sentenceCase(AUTO_MODE_FALLBACK_REASON),
+};
 
 export type SessionMode = {
   query: Pick<Query, "setPermissionMode">;
@@ -37,6 +49,10 @@ export type SessionModeManagerOptions<S extends SessionMode> = {
   sessionEndedMessage: string;
   updateConfigOption(sessionId: string, configId: string, value: string): Promise<void>;
   sessionUpdate(params: SessionNotification): Promise<void>;
+  /** Whether the client can present `notice` updates; the fallback warning
+   *  is a transcript line otherwise. Read per call: capabilities are only
+   *  known after `initialize`. */
+  supportsNotices?(): boolean;
   logError(...args: unknown[]): void;
 };
 
@@ -49,6 +65,8 @@ type InitializeSessionModeParams = {
   requestedMode: PermissionMode;
   currentModelInfo?: ModelInfo;
   currentModelId: string;
+  /** When false, bypassPermissions is omitted from the mode catalog. */
+  allowBypass: boolean;
 };
 
 /** Owns session-mode policy and the ACP/SDK synchronization it requires. */
@@ -60,11 +78,12 @@ export class SessionModeManager<S extends SessionMode> {
     requestedMode,
     currentModelInfo,
     currentModelId,
+    allowBypass,
   }: InitializeSessionModeParams): Promise<{
     modes: SessionModeState;
     autoModeFallbackWarningPending: boolean;
   }> {
-    const availableModes = this.buildAvailableModes();
+    const availableModes = this.buildAvailableModes(allowBypass);
     let effectiveMode = requestedMode;
     let autoModeFallbackWarningPending = false;
 
@@ -229,10 +248,14 @@ export class SessionModeManager<S extends SessionMode> {
     try {
       await this.options.sessionUpdate({
         sessionId,
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: AUTO_MODE_FALLBACK_NOTICE },
-        },
+        update: noticeOrTranscriptUpdate(
+          AUTO_MODE_FALLBACK_NOTICE,
+          this.options.supportsNotices?.() ?? false,
+          noticeTranscriptText({
+            ...AUTO_MODE_FALLBACK_NOTICE,
+            description: AUTO_MODE_FALLBACK_REASON,
+          }),
+        ),
       });
     } catch (error) {
       // The fallback has already been applied; a failed advisory must not turn
@@ -281,7 +304,7 @@ export class SessionModeManager<S extends SessionMode> {
     }
   }
 
-  private buildAvailableModes(): SessionModeState["availableModes"] {
+  private buildAvailableModes(allowBypass: boolean): SessionModeState["availableModes"] {
     const modes: SessionModeState["availableModes"] = [
       {
         id: "default",
@@ -308,7 +331,7 @@ export class SessionModeManager<S extends SessionMode> {
         _meta: { kind: "auto_review" },
       },
     ];
-    if (ALLOW_BYPASS) {
+    if (allowBypass) {
       modes.push({
         id: "bypassPermissions",
         name: "Bypass permissions",

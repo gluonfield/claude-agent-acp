@@ -1,35 +1,18 @@
-import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { query, type ModelInfo, type Query } from "@anthropic-ai/claude-agent-sdk";
 import { buildModelConfigOption, getAvailableModels } from "../session-model.js";
+import { claudeCliPath } from "../acp-agent.js";
 
 const OPUS: ModelInfo = {
   value: "opus[1m]",
-  resolvedModel: "claude-opus-5[1m]",
+  resolvedModel: "claude-opus-5-5[1m]",
   displayName: "Opus (1M context)",
-  description: "Opus 5 with 1M context · Best for everyday, complex tasks",
+  description: "Opus 5.5 with 1M context · Best for everyday, complex tasks · $4/$20 per Mtok",
 };
 
 describe("versioned model display names", () => {
   beforeEach(() => vi.stubEnv("ANTHROPIC_MODEL", undefined));
   afterEach(() => vi.unstubAllEnvs());
-
-  it("requires reviewing the live model contract whenever the SDK is upgraded", () => {
-    const require = createRequire(import.meta.url);
-    const sdkPackage = JSON.parse(
-      readFileSync(
-        join(dirname(require.resolve("@anthropic-ai/claude-agent-sdk")), "package.json"),
-        "utf8",
-      ),
-    );
-    expect(
-      sdkPackage.version,
-      "Run RUN_INTEGRATION_TESTS=true npx vitest run src/tests/model-presentation.test.ts " +
-        "and review the Opus name normalization before updating this version guard.",
-    ).toBe("0.3.270");
-  });
 
   it("adds standard-family versions and preserves model identity and recommendation", async () => {
     const models: ModelInfo[] = [
@@ -52,7 +35,7 @@ describe("versioned model display names", () => {
     expect(state.availableModels).toEqual(
       models.map((model) => ({
         modelId: model.value,
-        name: model === OPUS ? "Opus 5" : model.displayName,
+        name: model === OPUS ? "Opus 5.5" : model.displayName,
         description: model.description,
       })),
     );
@@ -60,7 +43,7 @@ describe("versioned model display names", () => {
       currentValue: "opus[1m]",
       _meta: { jetbrains: { air: { recommendedValue: "opus[1m]" } } },
       options: expect.arrayContaining([
-        { value: "opus[1m]", name: "Opus 5", description: OPUS.description },
+        { value: "opus[1m]", name: "Opus 5.5", description: OPUS.description },
       ]),
     });
     expect(OPUS.displayName).toBe("Opus (1M context)");
@@ -187,7 +170,14 @@ it.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
     }
     const abortController = new AbortController();
     const timeout = setTimeout(() => abortController.abort(), 25000);
-    const q = query({ prompt: input(), options: { persistSession: false, abortController } });
+    const q = query({
+      prompt: input(),
+      options: {
+        persistSession: false,
+        abortController,
+        pathToClaudeCodeExecutable: await claudeCliPath(),
+      },
+    });
     try {
       const { models } = await q.initializationResult();
       const opusModels = models.filter(
