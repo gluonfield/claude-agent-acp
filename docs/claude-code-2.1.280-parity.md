@@ -1,7 +1,7 @@
 # Claude Code 2.1.280 compatibility
 
 Validated on macOS arm64 on 2026-09-22 with Claude Agent SDK 0.3.280 and
-Claude ACP 0.81.0-jaz.1, using the same subscription OAuth profile as the native CLI.
+Claude ACP 0.81.0-jaz.2, using the same subscription OAuth profile as the native CLI.
 
 | Check                                | Native CLI            | ACP                   |
 | ------------------------------------ | --------------------- | --------------------- |
