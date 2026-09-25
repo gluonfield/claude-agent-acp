@@ -37,6 +37,7 @@ import {
   stripLocalCommandMetadata,
   ClaudeAcpAgent,
   claudeCliPath,
+  computeSessionFingerprint,
   streamEventToAcpNotifications,
   messageIdForGrouping,
   buildConfigOptions,
@@ -59,6 +60,7 @@ import {
   PermissionUpdate,
   query,
   SDKAssistantMessage,
+  type Options,
   type SDKControlGetUsageResponse,
 } from "@anthropic-ai/claude-agent-sdk";
 import { createHash, randomUUID } from "crypto";
@@ -1863,6 +1865,38 @@ describe("stripLocalCommandMetadata", () => {
     ).toBeNull();
   });
 
+  it("reconstructs marker-only model-bound slash skill prompts", () => {
+    expect(
+      stripLocalCommandMetadata(
+        "<command-message>example-skill</command-message>\n" +
+          "<command-name>/example-skill</command-name>\n" +
+          "<command-args>explain the startup decision</command-args>",
+      ),
+    ).toBe("/example-skill explain the startup decision");
+
+    expect(
+      stripLocalCommandMetadata([
+        {
+          type: "text",
+          text:
+            "<command-message>example-skill</command-message>\n" +
+            "<command-name>/example-skill</command-name>\n" +
+            "<command-args>explain the startup decision</command-args>",
+        },
+      ]),
+    ).toEqual([{ type: "text", text: "/example-skill explain the startup decision" }]);
+  });
+
+  it("keeps local-command stdout marker-only payloads hidden", () => {
+    expect(
+      stripLocalCommandMetadata(
+        "<command-name>/example-skill</command-name>" +
+          "<command-args>explain</command-args>" +
+          "<local-command-stdout>handled locally</local-command-stdout>",
+      ),
+    ).toBeNull();
+  });
+
   it("returns the string unchanged for real content", () => {
     expect(stripLocalCommandMetadata("hi")).toBe("hi");
     expect(stripLocalCommandMetadata("please run /model with args")).toBe(
@@ -2704,9 +2738,9 @@ describe("usage-limit failure replay", () => {
     session.input = input;
 
     await agent.prompt({ sessionId: "s1", prompt: [{ type: "text", text: "/usage" }] });
-    await vi.waitFor(() => {
-      expect(updates.some((update) => update.update.sessionUpdate === "usage_update")).toBe(true);
-    });
+    // The synthetic local-command frame carries zero usage; it must not be
+    // reported as the session's context usage.
+    expect(updates.filter((update) => update.update.sessionUpdate === "usage_update")).toEqual([]);
 
     const failures = updates
       .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
@@ -3618,6 +3652,113 @@ describe("permission request cancellation", () => {
       toolUseID: "tool-1",
       decisionClassification: "user_reject",
     });
+  });
+
+  it.each([
+    ["exit-plan-bypass", "bypassPermissions", true],
+    ["exit-plan-auto", "auto", true],
+    ["exit-plan-auto", "acceptEdits", false],
+    ["exit-plan-default", "default", true],
+  ])("publishes the effective mode after %s approval", async (optionId, mode, supportsAutoMode) => {
+    const sessionUpdate = vi.fn(async () => {});
+    const mockClient = {
+      sessionUpdate,
+      requestPermission: async () => ({ outcome: { outcome: "selected", optionId } }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+    session.modes = {
+      currentModeId: "plan",
+      availableModes: [
+        "default",
+        "plan",
+        "bypassPermissions",
+        ...(optionId === "exit-plan-bypass" ? [] : ["auto"]),
+      ].map((id) => ({
+        id,
+        name: id,
+      })),
+    };
+    session.configOptions = [
+      {
+        id: "mode",
+        name: "Mode",
+        type: "select",
+        currentValue: "plan",
+        options: [],
+      },
+    ];
+    session.modelInfos = [
+      { value: "default", displayName: "Default", description: "", supportsAutoMode },
+    ];
+
+    const result = await agent.canUseTool("session-1")(
+      "ExitPlanMode",
+      { plan: "Implement it" },
+      {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-plan",
+        requestId: "request-plan",
+      },
+    );
+
+    expect(result).toMatchObject({
+      behavior: "allow",
+      updatedPermissions: [{ type: "setMode", mode, destination: "session" }],
+    });
+    expect(session.modes.currentModeId).toBe(mode);
+    expect(sessionUpdate).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      update: { sessionUpdate: "current_mode_update", currentModeId: mode },
+    });
+    expect(sessionUpdate).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: [expect.objectContaining({ id: "mode", currentValue: mode })],
+      },
+    });
+  });
+
+  it("keeps the plan approval when publishing the new mode fails", async () => {
+    const error = vi.fn();
+    const mockClient = {
+      sessionUpdate: vi.fn(async (notification: SessionNotification) => {
+        if (notification.update.sessionUpdate === "current_mode_update") {
+          throw new Error("client gone");
+        }
+      }),
+      requestPermission: async () => ({
+        outcome: { outcome: "selected", optionId: "exit-plan-default" },
+      }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error });
+    const session = injectSession(agent, "session-1");
+    session.modes = {
+      currentModeId: "plan",
+      availableModes: ["default", "plan"].map((id) => ({ id, name: id })),
+    };
+
+    const result = await agent.canUseTool("session-1")(
+      "ExitPlanMode",
+      { plan: "Implement it" },
+      {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-plan",
+        requestId: "request-plan",
+      },
+    );
+
+    expect(result).toMatchObject({
+      behavior: "allow",
+      updatedPermissions: [{ type: "setMode", mode: "default", destination: "session" }],
+    });
+    expect(error).toHaveBeenCalledWith(
+      "Failed to publish mode after plan approval:",
+      expect.any(Error),
+    );
   });
 
   it("interrupts the turn after an ExitPlanMode keep-planning rejection", async () => {
@@ -7020,7 +7161,15 @@ describe("stop reason propagation", () => {
       { log: () => {}, error: () => {} },
     );
     (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    const priorAssistant = createAssistantError(undefined);
+    priorAssistant.message.usage = {
+      input_tokens: 170000,
+      output_tokens: 910,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    } as any;
     injectSession(agent, [
+      priorAssistant,
       createUsageLimitAssistantError(),
       createResultMessage({
         subtype: "success",
@@ -7045,6 +7194,42 @@ describe("stop reason propagation", () => {
       }),
     );
     expect(JSON.stringify(updates)).not.toContain("agent_message_chunk");
+    const usageUpdates = updates.filter((update) => update.update.sessionUpdate === "usage_update");
+    expect(usageUpdates.at(-1)?.update).toEqual(
+      expect.objectContaining({ used: 170910, size: 200000 }),
+    );
+  });
+
+  it("keeps the prior turn's context usage when a fresh turn is refused for quota", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    injectSession(agent, [
+      createUsageLimitAssistantError(),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "private provider detail",
+      }),
+    ]);
+    agent.sessions["test-session"].contextUsedTokens = 170910;
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(sessionFailureFromResponse(response)).toEqual(
+      expect.objectContaining({ category: "limit" }),
+    );
+    expect(updates.filter((update) => update.update.sessionUpdate === "usage_update")).toEqual([]);
+    expect(agent.sessions["test-session"].contextUsedTokens).toBe(170910);
   });
 
   it("preserves live usage-limit prose for clients without typed failures", async () => {
@@ -7297,6 +7482,35 @@ describe("stop reason propagation", () => {
     // The first delivery already rejected the turn, so the second one has no
     // turn to fail. That is expected here and must not be logged as a fault.
     expect(logged.join("\n")).not.toContain("cannot fail active turn");
+  });
+
+  it("does not treat a successful answer mentioning /login as auth_required", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    const answer = "A normal answer can quote: Please run /login.";
+    injectSession(agent, [
+      createAssistantError(undefined, answer),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: false,
+        result: answer,
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(sessionFailuresFromUpdates(updates)).toEqual([]);
   });
 
   it("republishes the signed-out state after a real model answer cleared the last one", async () => {
@@ -9200,10 +9414,19 @@ describe("getOrCreateSession param change detection", () => {
   function injectSession(
     agent: ClaudeAcpAgent,
     sessionId: string,
-    opts: { cwd?: string; mcpServers?: { name: string }[] } = {},
+    opts: {
+      cwd?: string;
+      mcpServers?: { name: string }[];
+      skills?: Options["skills"];
+      options?: Options;
+    } = {},
   ) {
     const cwd = opts.cwd ?? "/test";
     const mcpServers = (opts.mcpServers ?? []) as any[];
+    const options = {
+      ...opts.options,
+      ...(opts.skills !== undefined && { skills: opts.skills }),
+    };
     function* empty() {}
     const gen = Object.assign(empty(), {
       interrupt: vi.fn(),
@@ -9216,9 +9439,10 @@ describe("getOrCreateSession param change detection", () => {
       cancelled: false,
       titles: new SessionTitles(agent, sessionId),
       cwd,
-      sessionFingerprint: JSON.stringify({
+      sessionFingerprint: computeSessionFingerprint({
         cwd,
-        mcpServers: [...mcpServers].sort((a: any, b: any) => a.name.localeCompare(b.name)),
+        mcpServers,
+        _meta: { claudeCode: { options } },
       }),
       modes: { currentModeId: "default", availableModes: [] },
       models: { currentModelId: "default", availableModels: [] },
@@ -9330,6 +9554,145 @@ describe("getOrCreateSession param change detection", () => {
       sessionId: "s1",
       cwd: "/project",
       mcpServers: [...servers].reverse() as any,
+    });
+
+    expect(agent.sessions["s1"]).toBe(session);
+    expect(session.settingsManager.dispose).not.toHaveBeenCalled();
+  });
+
+  it.each<{
+    label: string;
+    previousSkills: Options["skills"];
+    nextSkills: Options["skills"];
+  }>([
+    { label: "CLI defaults to all skills", previousSkills: undefined, nextSkills: "all" },
+    { label: "all skills to no skills", previousSkills: "all", nextSkills: [] },
+    { label: "no skills to CLI defaults", previousSkills: [], nextSkills: undefined },
+    { label: "one explicit skill list to another", previousSkills: ["pdf"], nextSkills: ["docx"] },
+  ])(
+    "tears down the existing session when skills change from $label",
+    async ({ previousSkills, nextSkills }) => {
+      const agent = createMockAgent();
+      const session = injectSession(agent, "s1", {
+        cwd: "/project",
+        skills: previousSkills,
+      });
+      const meta =
+        nextSkills === undefined ? undefined : { claudeCode: { options: { skills: nextSkills } } };
+      const createSessionSpy = vi
+        .spyOn(agent as any, "createSession")
+        .mockRejectedValue(new Error("mock"));
+
+      await expect(
+        agent.resumeSession({
+          sessionId: "s1",
+          cwd: "/project",
+          mcpServers: [],
+          _meta: meta,
+        }),
+      ).rejects.toThrow("mock");
+
+      expect(session.settingsManager.dispose).toHaveBeenCalled();
+      expect(session.abortController.signal.aborted).toBe(true);
+      expect(session.query.interrupt).toHaveBeenCalled();
+      expect(agent.sessions["s1"]).toBeUndefined();
+      expect(createSessionSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ _meta: meta }),
+        expect.objectContaining({ resume: "s1" }),
+      );
+    },
+  );
+
+  it("treats reordered and duplicate skills as unchanged", async () => {
+    const agent = createMockAgent();
+    const session = injectSession(agent, "s1", {
+      cwd: "/project",
+      skills: ["pdf", "docx"],
+    });
+
+    await agent.resumeSession({
+      sessionId: "s1",
+      cwd: "/project",
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { skills: ["pdf", "docx", "pdf"] },
+        },
+      },
+    });
+
+    expect(agent.sessions["s1"]).toBe(session);
+    expect(session.settingsManager.dispose).not.toHaveBeenCalled();
+  });
+
+  it("tears down the existing session when any other Claude option changes", async () => {
+    const agent = createMockAgent();
+    const session = injectSession(agent, "s1", {
+      cwd: "/project",
+      options: { env: { CUSTOM_ENV: "original" } },
+    });
+    const createSessionSpy = vi
+      .spyOn(agent as any, "createSession")
+      .mockRejectedValue(new Error("mock"));
+
+    await expect(
+      agent.resumeSession({
+        sessionId: "s1",
+        cwd: "/project",
+        mcpServers: [],
+        _meta: { claudeCode: { options: { env: { CUSTOM_ENV: "changed" } } } },
+      }),
+    ).rejects.toThrow("mock");
+
+    expect(session.settingsManager.dispose).toHaveBeenCalled();
+    expect(agent.sessions["s1"]).toBeUndefined();
+    expect(createSessionSpy).toHaveBeenCalled();
+  });
+
+  it("tears down the existing session when additionalDirectories change", async () => {
+    const agent = createMockAgent();
+    const session = injectSession(agent, "s1", { cwd: "/project" });
+    vi.spyOn(agent as any, "createSession").mockRejectedValue(new Error("mock"));
+
+    await expect(
+      agent.resumeSession({
+        sessionId: "s1",
+        cwd: "/project",
+        mcpServers: [],
+        additionalDirectories: ["/other"],
+      }),
+    ).rejects.toThrow("mock");
+
+    expect(session.settingsManager.dispose).toHaveBeenCalled();
+    expect(agent.sessions["s1"]).toBeUndefined();
+  });
+
+  it("ignores option key order, per-call resume controls and creation-only options", async () => {
+    const agent = createMockAgent();
+    const session = injectSession(agent, "s1", {
+      cwd: "/project",
+      options: { maxTurns: 10, env: { A: "1", B: "2" } },
+    });
+
+    await agent.resumeSession({
+      sessionId: "s1",
+      cwd: "/project",
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: {
+            env: { B: "2", A: "1" },
+            maxTurns: 10,
+            resume: "s1",
+            sessionId: "s1",
+            forkSession: false,
+            resumeSessionAt: "msg-1",
+            resumeDropsTurn: "msg-1",
+            title: "Renamed",
+            abortController: new AbortController(),
+          },
+        },
+      },
     });
 
     expect(agent.sessions["s1"]).toBe(session);
@@ -9586,6 +9949,48 @@ describe("usage_update computation", () => {
     expect(usageUpdates[1].update.used).toBe(1800);
     expect(usageUpdates[1].update.size).toBe(1000000);
     expect(usageUpdates[1].update.cost).toBeDefined();
+  });
+
+  it("includes the effective model id on usage_update notifications", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createStreamEvent("message_start", {
+        model: "claude-sonnet-4-20250514",
+        usage: {
+          input_tokens: 1000,
+          output_tokens: 0,
+          cache_read_input_tokens: 200,
+          cache_creation_input_tokens: 100,
+        },
+      }),
+      createStreamEvent("message_delta", {
+        usage: { output_tokens: 500 },
+      }),
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-sonnet-4-20250514": {
+            inputTokens: 1000,
+            outputTokens: 500,
+            cacheReadInputTokens: 200,
+            cacheCreationInputTokens: 100,
+            webSearchRequests: 0,
+            costUSD: 0.01,
+            contextWindow: 200000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdates).toHaveLength(3);
+    for (const { update } of usageUpdates) {
+      expect(update).not.toHaveProperty("model");
+      expect(update._meta?.["_claude/model"]).toBe("claude-sonnet-4-20250514");
+    }
   });
 
   it("stream_event message_delta patches previous snapshot", async () => {
@@ -12302,7 +12707,7 @@ describe("assembled assistant text fallback", () => {
     });
   }
 
-  it("does not re-emit the result text after an informational notice delivered it", async () => {
+  it("marks informational notices with metadata", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // A hook-blocked prompt: the SDK surfaces the block reason as an
     // informational notice and then repeats it on the result with zero output
@@ -12322,7 +12727,34 @@ describe("assembled assistant text fallback", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
 
+    const chunks = updates.filter(({ update }) => update.sessionUpdate === "agent_message_chunk");
     expect(messageChunkTexts(updates)).toEqual(["**Warning:** hook says no"]);
+    expect(chunks[0]?.update).toMatchObject({
+      _meta: { claudeCode: { kind: "informational", level: "warning" } },
+    });
+  });
+
+  it("marks info-level notices even when their text has no severity prefix", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "informational",
+        content: "plain hook detail",
+        level: "info",
+        session_id: "test-session",
+      },
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    const chunks = updates.filter(({ update }) => update.sessionUpdate === "agent_message_chunk");
+    expect(messageChunkTexts(updates)).toEqual(["plain hook detail"]);
+    expect(chunks[0]?.update).toMatchObject({
+      _meta: { claudeCode: { kind: "informational", level: "info" } },
+    });
   });
 
   it("delivers an informational frame as a notice and still owns the result text", async () => {
@@ -12876,10 +13308,11 @@ describe("result origin handling", () => {
     expect(usageUpdate).toBeDefined();
     expect(usageUpdate.update._meta).toEqual({
       "_claude/origin": { kind: "channel", server: "acp" },
+      "_claude/model": "claude-sonnet-4-6",
     });
   });
 
-  it("omits _meta when origin is absent", async () => {
+  it("carries only the model in _meta when origin is absent", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
       createAssistantMessage(),
@@ -12891,7 +13324,7 @@ describe("result origin handling", () => {
 
     const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdate).toBeDefined();
-    expect(usageUpdate.update._meta).toBeUndefined();
+    expect(usageUpdate.update._meta).toEqual({ "_claude/model": "claude-sonnet-4-6" });
   });
 
   it("task-notification result with max_tokens does not override the user-turn stopReason", async () => {
@@ -15133,6 +15566,159 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     expect(summaryIndex).toBeGreaterThanOrEqual(0);
     expect(summaryIndex).toBeLessThan(events.indexOf("resolved"));
     await agent.sessions["test-session"]?.consumer;
+  });
+
+  describe("ExitPlanMode answered inside a held turn's followup (issue #1167)", () => {
+    // Plan mode + a background Explore agent: the user turn's result holds,
+    // the subagent finishes, and the model writes the plan and calls
+    // ExitPlanMode in the task-notification cycle. The interrupted cycle's
+    // diagnostic carries that cycle's task-notification origin.
+    function* heldTurnPlanningFollowup(first: any) {
+      yield userEcho(first);
+      yield running();
+      yield subagentStarted("agent-1");
+      yield resultMessage(); // held for agent-1
+      yield taskNotification("agent-1");
+      yield {
+        type: "assistant",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "tool-plan",
+              name: "ExitPlanMode",
+              input: { plan: "Implement it" },
+            },
+          ],
+          usage: {},
+        },
+      };
+      yield {
+        type: "user",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tool-plan",
+              content: "User accepted the plan and requested a fresh context",
+              is_error: true,
+            },
+          ],
+        },
+        tool_result_meta: [{ id: "tool-plan", non_execution_kind: "user-rejected" }],
+      };
+      yield resultMessage({
+        subtype: "error_during_execution",
+        is_error: true,
+        stop_reason: null,
+        errors: ["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],
+        origin: { kind: "task-notification" },
+      });
+    }
+
+    it("continues an accepted clear-context plan in a fresh query instead of ending the turn", async () => {
+      const updates: any[] = [];
+      const agent = new ClaudeAcpAgent(
+        { sessionUpdate: async (n: any) => updates.push(n) } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      let continuation: unknown;
+      const createSession = vi
+        .spyOn(agent as any, "createSession")
+        .mockImplementation(async (_params: any, options: any) => {
+          const input = new Pushable<any>();
+          async function* freshGenerator() {
+            const next = await input[Symbol.asyncIterator]().next();
+            continuation = next.value;
+            yield userEcho(next.value);
+            yield running();
+            yield assistantText("Implemented");
+            yield resultMessage({ stop_reason: "max_tokens" });
+            yield idle();
+          }
+          agent.sessions["test-session"] = mockSessionState({
+            query: wrapQuery(freshGenerator()),
+            input,
+            modes: { currentModeId: options.permissionMode, availableModes: [] },
+            fastModeEnabled: false,
+          });
+          return { sessionId: "test-session" };
+        });
+      injectGeneratorSession(
+        agent,
+        (input) => {
+          async function* messageGenerator() {
+            const { value: first } = await input[Symbol.asyncIterator]().next();
+            yield* heldTurnPlanningFollowup(first);
+            yield idle();
+          }
+          return messageGenerator();
+        },
+        {
+          creationParams: { cwd: "/test", mcpServers: [] },
+          pendingExitPlanContextReset: {
+            toolUseId: "tool-plan",
+            plan: "Implement it",
+            mode: "auto",
+          },
+        },
+      );
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "plan" }],
+      });
+
+      expect(createSession).toHaveBeenCalledWith(
+        expect.objectContaining({ cwd: "/test" }),
+        expect.objectContaining({ publicSessionId: "test-session", permissionMode: "auto" }),
+      );
+      expect(JSON.stringify(continuation)).toContain(
+        "Implement the following plan:\\n\\nImplement it",
+      );
+      // Settled by the continuation's own result, not the pre-restart hold.
+      expect(response.stopReason).toBe("max_tokens");
+      expect(updates).toContainEqual(
+        expect.objectContaining({
+          update: expect.objectContaining({
+            sessionUpdate: "current_mode_update",
+            currentModeId: "auto",
+          }),
+        }),
+      );
+    });
+
+    it("cancels the held turn when the user keeps planning", async () => {
+      const agent = createMockAgent();
+      const createSession = vi.spyOn(agent as any, "createSession");
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const { value: first } = await input[Symbol.asyncIterator]().next();
+          yield* heldTurnPlanningFollowup(first);
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "plan" }],
+      });
+
+      expect(response.stopReason).toBe("cancelled");
+      // The user turn's own usage, not the followup's.
+      expect(response.usage?.totalTokens).toBe(15);
+      expect(createSession).not.toHaveBeenCalled();
+      expect(agent.sessions["test-session"].pendingExitPlanModeInterruption).toBeUndefined();
+    });
   });
 
   // CLI 2.1.270+ stays `running` while background agents live (verified
@@ -17790,6 +18376,169 @@ describe("turn steering (_session/steering)", () => {
     await expect(
       agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "next" }] }),
     ).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    expect(agent.sessions["test-session"].owedTrailingIdles).toBe(0);
+  });
+
+  // Issue #1114: the CLI never replays the steered message's echo, so the idle
+  // lane would swallow every idle and park the prompt. A result stamped with the
+  // steer's uuid proves the steered work ran: it settles the turn right there,
+  // and owes its trailing idle like any other settling result.
+  it("settles a steered turn at a result that names the steer, even with its echo missing", async () => {
+    const timeline: string[] = [];
+    const agent = new ClaudeAcpAgent(timelineClient(timeline), {
+      log: () => {},
+      error: () => {},
+    });
+    let releaseIdle = () => {};
+    const idleReleased = new Promise<void>((resolve) => (releaseIdle = resolve));
+    let releaseEnd = () => {};
+    const ended = new Promise<void>((resolve) => (releaseEnd = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield createAssistantText("working on it");
+        const steered = await iter.next();
+        yield { ...interruptedCycleResult(), user_message_uuid: u1.value.uuid };
+        // No echo for the steered message.
+        yield createAssistantText("STEERED-OK");
+        yield {
+          ...createResultMessage(),
+          user_message_uuid: steered.value.uuid,
+          user_message_uuids: [steered.value.uuid],
+        };
+        await idleReleased;
+        yield idleMessage(); // the settling result's own trailer
+        // Held open: no teardown may rescue the turn.
+        await ended;
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
+      .then((response) => {
+        timeline.push(`prompt:${response.stopReason}`);
+        return response;
+      });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle X" }],
+    });
+
+    // Settles before any idle arrives.
+    const response = await turn;
+    expect(timeline).toEqual(["working on it", "STEERED-OK", "prompt:end_turn"]);
+    expect(response.usage?.inputTokens).toBe(20);
+    expect(agent.sessions["test-session"].owedTrailingIdles).toBe(1);
+
+    releaseIdle();
+    await waitFor(() => agent.sessions["test-session"].owedTrailingIdles === 0);
+    releaseEnd();
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  // Issue #1114's other hang, and #1063's: the steer aborts an autonomous
+  // followup, whose result counts a trailing idle that the abort then folds into
+  // the one idle spanning both cycles. Absorbing that idle as debt would starve
+  // the steered turn of the only signal it settles on.
+  it("settles a ready steered turn at an idle that owed-idle debt would absorb", async () => {
+    const agent = createMockAgent();
+    let releaseEnd = () => {};
+    const ended = new Promise<void>((resolve) => (releaseEnd = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        const steered = await iter.next();
+        // The aborted cycle is an autonomous followup: it owes a trailer.
+        yield { ...createResultMessage(), origin: { kind: "task-notification" } };
+        yield userEcho(steered.value);
+        yield createAssistantText("STEERED-OK");
+        yield createResultMessage(); // unstamped producer
+        yield idleMessage(); // the only idle
+        await ended;
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle X" }],
+    });
+
+    await expect(turn).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    releaseEnd();
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  // The guard the ready lane must keep: an owed idle arriving after the steered
+  // echo but before the steered cycle's result belongs to an earlier cycle. The
+  // outcome recorded by then is the interrupted cycle's, so settling on it would
+  // answer the prompt while the steered answer is still streaming.
+  it("does not settle a steered turn on a lagged owed idle before the steered result", async () => {
+    const timeline: string[] = [];
+    const agent = new ClaudeAcpAgent(timelineClient(timeline), {
+      log: () => {},
+      error: () => {},
+    });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        // An autonomous cycle finishes mid-turn; its trailer lags.
+        yield {
+          ...createResultMessage(),
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+          origin: { kind: "task-notification" },
+        };
+        yield createAssistantText("working on it");
+        const steered = await iter.next();
+        yield interruptedCycleResult();
+        yield userEcho(steered.value);
+        yield idleMessage(); // the autonomous cycle's lagged trailer
+        yield createAssistantText("STEERED-OK");
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
+      .then((response) => {
+        timeline.push(`prompt:${response.stopReason}`);
+        return response;
+      });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle X" }],
+    });
+
+    const response = await turn;
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(timeline).toEqual(["working on it", "STEERED-OK", "prompt:end_turn"]);
+    // Both cycles' usage, not just the interrupted one's.
+    expect(response.usage?.inputTokens).toBe(20);
     expect(agent.sessions["test-session"].owedTrailingIdles).toBe(0);
   });
 

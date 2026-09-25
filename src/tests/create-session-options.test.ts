@@ -36,6 +36,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
       capturedOptions = args.options;
       return makeMockQuery({
         applyFlagSettings: applyFlags,
+        interrupt: async () => undefined,
+        close: () => {},
         initializationResult: async () => ({
           models: initModels ?? [
             {
@@ -122,6 +124,47 @@ describe("createSession options merging", () => {
       applyFlags.mock.calls.filter(([settings]) => Object.hasOwn(settings, "effortLevel")),
     ).toEqual([]);
   });
+  for (const method of ["resumeSession", "loadSession"] as const) {
+    for (const limit of ["maxTurns", "maxBudgetUsd"] as const) {
+      it(`${method} applies added, tightened and removed ${limit} to the SDK query`, async () => {
+        const cwd = process.cwd();
+        const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+
+        for (const value of [10, 1, undefined]) {
+          const previousOptions = capturedOptions;
+          await agent[method]({
+            sessionId,
+            cwd,
+            mcpServers: [],
+            _meta: { claudeCode: { options: { [limit]: value } } },
+          });
+
+          expect(capturedOptions).not.toBe(previousOptions);
+          expect(capturedOptions?.[limit]).toBe(value);
+          expect(capturedOptions?.resume).toBe(sessionId);
+        }
+      });
+    }
+
+    it(`${method} reuses the SDK query when execution limits are unchanged`, async () => {
+      const cwd = process.cwd();
+      const { sessionId } = await agent.newSession({
+        cwd,
+        mcpServers: [],
+        _meta: { claudeCode: { options: { maxTurns: 10, maxBudgetUsd: 1 } } },
+      });
+      const previousOptions = capturedOptions;
+
+      await agent[method]({
+        sessionId,
+        cwd,
+        mcpServers: [],
+        _meta: { claudeCode: { options: { maxBudgetUsd: 1, maxTurns: 10 } } },
+      });
+
+      expect(capturedOptions).toBe(previousOptions);
+    });
+  }
 
   describe("allowDangerouslySkipPermissions", () => {
     it("requests bypass capability by default and mirrors it in the mode catalog", async () => {
@@ -343,6 +386,36 @@ describe("createSession options merging", () => {
     });
 
     expect(capturedOptions!.tools).toEqual([]);
+  });
+
+  it("recreates a resumed Query with changed skills and the same session ID", async () => {
+    const created = await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { skills: ["pdf"] },
+        },
+      },
+    });
+    const initialQuery = agent.sessions[created.sessionId]!.query;
+    expect(capturedOptions!.skills).toEqual(["pdf"]);
+
+    await agent.resumeSession({
+      sessionId: created.sessionId,
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { skills: ["docx"] },
+        },
+      },
+    });
+
+    expect(Object.keys(agent.sessions)).toEqual([created.sessionId]);
+    expect(agent.sessions[created.sessionId]!.query).not.toBe(initialQuery);
+    expect(capturedOptions!.resume).toBe(created.sessionId);
+    expect(capturedOptions!.skills).toEqual(["docx"]);
   });
 
   describe("subagent transcript forwarding", () => {

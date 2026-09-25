@@ -248,8 +248,8 @@ import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./u
 import {
   acceptedPlanToolResult,
   ExitPlanCoordinator,
-  executionDiagnostic,
   exitPlanModeRawOutput,
+  isExitPlanInterruptionResult,
   observeExitPlanToolResults,
 } from "./exit-plan.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
@@ -687,16 +687,35 @@ type Turn = {
    *  indistinguishable from a turn's terminal one — and the steered message runs
    *  as a SECOND cycle. Settling at that result would answer `session/prompt`
    *  mid-work, so a steered turn's results only RECORD their outcome
-   *  (`steeredSettle`) and it settles at the SDK's `idle`, the only signal
-   *  spanning both cycles (CLI 2.1.220).
+   *  (`steeredSettle`) until one provably answers the steer.
+   *
+   *  Two signals prove it. Exact: a result whose `user_message_uuids` names
+   *  one of `steeredUuids` consumed the steered message, so once no echo is
+   *  outstanding it is the turn's terminal result and the turn leaves the steer
+   *  lane to settle there like any other (this also retires an echo the CLI
+   *  never replayed). Fallback, for producers that don't stamp results: the
+   *  SDK's `idle` after a result recorded since the last echo (see
+   *  `steeredAwaitingResult`), the only signal spanning both cycles
+   *  (CLI 2.1.220).
    *
    *  A non-empty set at an idle means the steered cycle hasn't started — the CLI
    *  replays a message only when it picks it up, always after the interrupted
-   *  cycle's result — so that idle is swallowed. Drained by the replay handler.
+   *  cycle's result — so that idle is swallowed. Drained by the replay handler
+   *  and by stamped results.
    *
-   *  Residual: a message the CLI drops unreplayed parks the turn until
-   *  `session/cancel` or the next prompt (both settle it). */
+   *  Residual: a message the CLI drops unreplayed, with no stamped result naming
+   *  it, parks the turn until `session/cancel` or the next prompt (both settle
+   *  it). */
   steeredEchoes?: Set<string>;
+  /** Every steer this turn has taken, echoed or not: a stamped result naming one
+   *  answers the steer even after its echo drained `steeredEchoes`. */
+  steeredUuids?: Set<string>;
+  /** Set when a steered echo drains and cleared when a result records
+   *  `steeredSettle`. `steeredSettle` can already hold the interrupted cycle's
+   *  outcome (or a held turn's, moved over by `steer()`) when the echo lands, so
+   *  while this is set the recorded outcome predates the steered work and an
+   *  idle must not settle on it. */
+  steeredAwaitingResult?: boolean;
   /** What a steered turn settles with once its steered work has run: the outcome
    *  of its latest result, so its usage covers every cycle the turn ran. */
   steeredSettle?: PromptResponse;
@@ -801,8 +820,8 @@ export type Session = {
    *  without ever reaching the model). */
   queryClosed?: boolean;
   cwd: string;
-  /** Serialized snapshot of session-defining params (cwd, mcpServers) used to
-   *  detect when loadSession/resumeSession is called with changed values. */
+  /** Serialized snapshot of session-defining params (cwd, mcpServers, skills)
+   *  used to detect when loadSession/resumeSession is called with changed values. */
   sessionFingerprint: string;
   /** Original ACP parameters used to recreate this query with a new provider. */
   creationParams?: NewSessionRequest;
@@ -827,6 +846,8 @@ export type Session = {
    *  (see resumedFirstResultModelUsage). */
   lastModelUsageReading?: ModelTokenTally;
   modes: SessionModeState;
+  /** The mode the session left when it entered plan mode, if it is in plan. */
+  prePlanMode?: string;
   models: SessionModelState;
   modelInfos: ModelInfo[];
   /** Prevents the model-specific Auto fallback from spamming the transcript. */
@@ -1124,6 +1145,29 @@ function isSteering(turn: Turn | null | undefined): turn is Turn & { steeredEcho
   return turn != null && turn.steeredEchoes !== undefined && !turn.settled;
 }
 
+/** Whether a steered turn's recorded outcome is its steered work's own: every
+ *  steered message has been picked up and a result arrived after the last one
+ *  (see Turn.steeredAwaitingResult), so the next idle can settle it. */
+function isSteeredSettleReady(
+  turn: Turn | null | undefined,
+): turn is Turn & { steeredEchoes: Set<string>; steeredSettle: PromptResponse } {
+  return (
+    isSteering(turn) &&
+    turn.steeredEchoes.size === 0 &&
+    turn.steeredSettle !== undefined &&
+    !turn.steeredAwaitingResult
+  );
+}
+
+/** Take a turn out of the steer lane so its settlement follows the ordinary
+ *  result/idle rules again. */
+function leaveSteerLane(turn: Turn): void {
+  turn.steeredEchoes = undefined;
+  turn.steeredUuids = undefined;
+  turn.steeredAwaitingResult = undefined;
+  turn.steeredSettle = undefined;
+}
+
 /** Disarm the force-cancel backstop (see Session.forceCancelTimer). Every
  *  path that settles the active turn must run this so a timer can never fire
  *  on an already-settled turn — and must leave the field undefined, or the
@@ -1136,16 +1180,145 @@ function disarmForceCancel(session: Session): void {
   }
 }
 
+/** Normalize skills without changing their SDK semantics. Array order and
+ *  duplicates do not affect the selected skill set, so neither should rebuild
+ *  the underlying Query process. */
+function normalizeSkills(skills: Options["skills"]): Options["skills"] {
+  return Array.isArray(skills) ? [...new Set(skills)].sort() : skills;
+}
+
+/** Whether a changed `_meta.claudeCode.options` key on session/load or
+ *  session/resume must rebuild the Query process. Almost every option is read
+ *  only when the process starts, so the default is `true`. Every key of the
+ *  SDK's `Options` must be classified: an SDK bump that adds or removes an
+ *  option fails to compile until it is decided here. */
+const OPTION_REBUILDS_SESSION = {
+  additionalDirectories: true,
+  agentProgressSummaries: true,
+  agents: true,
+  allowDangerouslySkipPermissions: true,
+  allowedTools: true,
+  betas: true,
+  debug: true,
+  debugFile: true,
+  disallowedTools: true,
+  effort: true,
+  enableFileCheckpointing: true,
+  env: true,
+  executableArgs: true,
+  extraArgs: true,
+  fallbackModel: true,
+  forwardSubagentText: true,
+  includeHookEvents: true,
+  managedSettings: true,
+  maxBudgetUsd: true,
+  maxThinkingTokens: true,
+  maxTurns: true,
+  mcpServers: true,
+  model: true,
+  outputFormat: true,
+  pathToClaudeCodeExecutable: true,
+  permissionPrompts: true,
+  permissionPromptToolName: true,
+  persistSession: true,
+  perTaskStopAffordance: true,
+  planModeInstructions: true,
+  pluginDelivery: true,
+  plugins: true,
+  projectConfigRoot: true,
+  promptSuggestions: true,
+  sandbox: true,
+  sessionStoreFlush: true,
+  settings: true,
+  settingSources: true,
+  skills: true,
+  strictMcpConfig: true,
+  supportedDialogKinds: true,
+  systemPrompt: true,
+  taskBudget: true,
+  thinking: true,
+  toolAliases: true,
+  toolConfig: true,
+  tools: true,
+  verbatimPrompts: true,
+  // Managed or ignored by the adapter.
+  agent: false,
+  cwd: false,
+  executable: false,
+  includePartialMessages: false,
+  permissionMode: false,
+  // Per-call controls for attaching to the stored conversation.
+  continue: false,
+  forkSession: false,
+  resume: false,
+  resumeDropsTurn: false,
+  resumeSessionAt: false,
+  sessionId: false,
+  // Callbacks and live objects: they cannot cross JSON-RPC and have no stable serialized form.
+  abortController: false,
+  canUseTool: false,
+  hooks: false,
+  onElicitation: false,
+  onUserDialog: false,
+  sessionStore: false,
+  spawnClaudeCodeProcess: false,
+  stderr: false,
+  // No effect on an already-created session.
+  loadTimeoutMs: false,
+  title: false,
+} as const satisfies Record<keyof Options, boolean>;
+
+/** A JSON value with object keys sorted, so key order never changes a
+ *  fingerprint. Functions and class instances (hook callbacks, abort
+ *  controllers, in-process MCP servers) cannot cross JSON-RPC and have no
+ *  stable serialized form, so they are left out. */
+function canonicalJson(value: unknown): unknown {
+  if (typeof value === "function") return undefined;
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return undefined;
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, canonicalJson((value as Record<string, unknown>)[key])])
+      .filter(([, entry]) => entry !== undefined),
+  );
+}
+
 /** Compute a stable fingerprint of the session-defining params so we can
  *  detect when a loadSession/resumeSession call requires tearing down and
- *  recreating the underlying Query process.  MCP servers are sorted by name
- *  so that ordering differences don't trigger unnecessary recreations. */
-function computeSessionFingerprint(params: {
+ *  recreating the underlying Query process. Every option classified in
+ *  {@link OPTION_REBUILDS_SESSION} is covered, so a warm resume never silently
+ *  keeps stale values. MCP servers are sorted by name, and skills are
+ *  normalized as a set, so ordering differences don't trigger unnecessary
+ *  recreations. */
+export function computeSessionFingerprint(params: {
   cwd: string;
   mcpServers?: NewSessionRequest["mcpServers"];
+  additionalDirectories?: NewSessionRequest["additionalDirectories"];
+  _meta?: NewSessionRequest["_meta"];
 }): string {
   const servers = [...(params.mcpServers ?? [])].sort((a, b) => a.name.localeCompare(b.name));
-  return JSON.stringify({ cwd: params.cwd, mcpServers: servers });
+  const meta = params._meta as (NewSessionMeta & Record<string, unknown>) | undefined;
+  const options: Record<string, unknown> = Object.fromEntries(
+    Object.entries(meta?.claudeCode?.options ?? {}).filter(
+      ([key]) => (OPTION_REBUILDS_SESSION as Record<string, boolean>)[key] === true,
+    ),
+  );
+  options.skills = normalizeSkills(options.skills as Options["skills"]);
+  return JSON.stringify(
+    canonicalJson({
+      cwd: params.cwd,
+      mcpServers: servers,
+      additionalDirectories: params.additionalDirectories,
+      additionalRoots: meta?.additionalRoots,
+      systemPrompt: meta?.systemPrompt,
+      disableBuiltInTools: meta?.disableBuiltInTools,
+      emitRawSDKMessages: meta?.claudeCode?.emitRawSDKMessages,
+      options,
+    }),
+  );
 }
 
 export type SDKMessageFilter = {
@@ -1219,6 +1392,7 @@ const AUTH_REQUIRED_CODE = RequestError.authRequired().code;
 const SUPPORTED_PROTOCOLS: LlmProtocol[] = ["anthropic", "bedrock", "vertex"];
 const PROVIDER_ID = "main";
 const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com";
+const DEFAULT_VERTEX_BASE_URL = "https://aiplatform.googleapis.com";
 
 /**
  * Vertex needs project + region that the standard `providers/set` payload
@@ -1493,6 +1667,17 @@ const SESSION_ENDED_MESSAGE = "The Claude Agent session has ended. Please start 
 // message and without invoking the model.
 const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
 
+// Commands whose marker-only transcript records are ACP/client-local UI noise,
+// not model-visible user prompts. Marker-only custom slash skills are not in
+// this list, so replay can reconstruct them from `<command-name>`/`<command-args>`.
+const REPLAY_HIDDEN_COMMANDS = new Set([
+  ...LOCAL_ONLY_COMMANDS,
+  "/compact",
+  "/model",
+  "/status",
+  "/usage",
+]);
+
 // The Claude SDK persists local slash command invocations (e.g. `/model`) and
 // their output as user messages in the session transcript, wrapping the
 // payload in these XML-like markers that the CLI uses for its own display.
@@ -1549,6 +1734,38 @@ function stripMarkerTags(text: string): string {
   return result + text.slice(copiedUpTo);
 }
 
+function markerTagText(text: string, tag: string): string | undefined {
+  const open = `<${tag}>`;
+  const close = `</${tag}>`;
+  const start = text.indexOf(open);
+  if (start === -1) return undefined;
+  const end = text.indexOf(close, start + open.length);
+  if (end === -1) return undefined;
+  return text.slice(start + open.length, end);
+}
+
+function hasMarkerTag(text: string, tag: string): boolean {
+  return markerTagText(text, tag) !== undefined;
+}
+
+function commandInvocationFromMarkerOnlyText(text: string): string | null {
+  if (hasMarkerTag(text, "local-command-stdout") || hasMarkerTag(text, "local-command-stderr")) {
+    return null;
+  }
+  const commandName = markerTagText(text, "command-name")?.trim();
+  if (!commandName?.startsWith("/")) return null;
+  if (REPLAY_HIDDEN_COMMANDS.has(commandName.split(" ", 1)[0])) return null;
+
+  const commandArgs = markerTagText(text, "command-args")?.trim();
+  return commandArgs ? `${commandName} ${commandArgs}` : commandName;
+}
+
+function stripLocalCommandMetadataText(text: string): string | null {
+  const stripped = stripMarkerTags(text);
+  if (stripped.trim() !== "") return stripped;
+  return commandInvocationFromMarkerOnlyText(text);
+}
+
 /**
  * Return user-message content with local-command and injected-context marker
  * tags removed, or `null` if nothing meaningful remains (caller should skip
@@ -1558,8 +1775,7 @@ function stripMarkerTags(text: string): string {
  */
 export function stripLocalCommandMetadata(content: unknown): unknown | null {
   if (typeof content === "string") {
-    const stripped = stripMarkerTags(content);
-    return stripped.trim() === "" ? null : stripped;
+    return stripLocalCommandMetadataText(content);
   }
   if (!Array.isArray(content)) return content;
 
@@ -1573,8 +1789,8 @@ export function stripLocalCommandMetadata(content: unknown): unknown | null {
       "text" in block &&
       typeof (block as { text: unknown }).text === "string"
     ) {
-      const stripped = stripMarkerTags((block as { text: string }).text);
-      if (stripped.trim() === "") continue;
+      const stripped = stripLocalCommandMetadataText((block as { text: string }).text);
+      if (stripped === null) continue;
       kept.push({ ...(block as object), text: stripped });
     } else {
       kept.push(block);
@@ -2580,7 +2796,7 @@ export class ClaudeAcpAgent {
     if (process.env.CLAUDE_CODE_USE_VERTEX) {
       return {
         apiType: "vertex",
-        baseUrl: process.env.ANTHROPIC_VERTEX_BASE_URL ?? "https://aiplatform.googleapis.com",
+        baseUrl: process.env.ANTHROPIC_VERTEX_BASE_URL ?? DEFAULT_VERTEX_BASE_URL,
         headers: {},
       };
     }
@@ -3003,7 +3219,7 @@ export class ClaudeAcpAgent {
    *
    *  Pre-empting means ABORTING: the interrupted cycle emits a `result` of its
    *  own and the steered message runs as a second one, so the turn is marked
-   *  (`Turn.steeredEchoes`) to settle at the SDK's `idle` instead of that result.
+   *  (`Turn.steeredEchoes`) to settle only once a result answers the steer.
    *
    *  When the session is idle, the opt-in path returns `promptRequired` WITHOUT
    *  calling `prompt()`, pushing SDK input, or mutating `turnQueue`: the content
@@ -3070,6 +3286,7 @@ export class ClaudeAcpAgent {
     // time the consumer next runs, and an unmarked result would settle the turn
     // (see Turn.steeredEchoes).
     (turnInFlight.steeredEchoes ??= new Set()).add(steeredUuid);
+    (turnInFlight.steeredUuids ??= new Set()).add(steeredUuid);
     // A turn already held for background subagents has a recorded outcome the
     // steer supersedes: move it into the steer lane so one lane owns settlement.
     // The idle handler re-applies the hold through the subagent gate.
@@ -3338,6 +3555,28 @@ export class ClaudeAcpAgent {
       await sessionFailures.clear(
         (failure) => failure.recoveryPolicy === "next_attempt" && failure.turnId !== activeTurnId,
       );
+    };
+
+    // ACP's usage_update has no model field, so the model the usage belongs
+    // to rides in `_meta` alongside the other `_claude/*` keys.
+    const attachUsageModel = <
+      T extends {
+        sessionUpdate: "usage_update";
+        used: number;
+        size: number;
+        _meta?: Record<string, unknown> | null;
+      },
+    >(
+      update: T,
+    ): T => {
+      if (!lastAssistantModel) return update;
+      return {
+        ...update,
+        _meta: {
+          ...(update._meta ?? {}),
+          "_claude/model": lastAssistantModel,
+        },
+      };
     };
 
     const internalErrorForClient = (data: unknown, rawDetail?: string) =>
@@ -3658,6 +3897,7 @@ export class ClaudeAcpAgent {
       // so the last result and its usage win.
       if (isSteering(session.activeTurn)) {
         session.activeTurn.steeredSettle = outcome;
+        session.activeTurn.steeredAwaitingResult = false;
         return;
       }
       if (
@@ -4196,11 +4436,11 @@ export class ClaudeAcpAgent {
                 session.contextUsedTokens = usedTokens;
                 await sendUpdate({
                   sessionId: message.session_id,
-                  update: {
+                  update: attachUsageModel({
                     sessionUpdate: "usage_update",
                     used: lastAssistantTotalUsage,
                     size: session.contextWindowSize,
-                  },
+                  }),
                 });
                 break;
               }
@@ -4238,10 +4478,9 @@ export class ClaudeAcpAgent {
                   // (verified live: user result → task_notification →
                   // followup result → ONE idle), so a held turn's own result
                   // leaves one unpaid unit per hold. Left in place, each unit
-                  // would absorb a later un-owed idle — masking an issue-#825
-                  // detection — or swallow the idle a steered turn settles on
-                  // (the owed-idle branch below runs before the steer lane),
-                  // hanging that prompt. Sweep it.
+                  // would absorb a later un-owed idle, masking an issue-#825
+                  // detection (the ready steer lane below also leaves debt
+                  // standing when it settles). Sweep it.
                   this.logger.log(
                     `[claude-agent-acp] Session ${params.sessionId}: dropping ${session.owedTrailingIdles} unpaid trailing-idle debt at the running transition`,
                   );
@@ -4304,37 +4543,42 @@ export class ClaudeAcpAgent {
                       session.owedTrailingIdles--;
                     }
                     await settleDeferredIfDrained();
+                  } else if (isSteeredSettleReady(session.activeTurn)) {
+                    // A steered turn whose steered work has produced its result
+                    // (see Turn.steeredEchoes) settles at the next idle — the
+                    // only signal spanning the interrupted and steered cycles
+                    // when results aren't stamped. AHEAD of owed-idle debt:
+                    // the outcome is final, so whichever idle this is settles
+                    // the turn correctly, while debt absorption could swallow
+                    // the only idle it gets — e.g. a steer that aborted an
+                    // autonomous followup, whose counted trailer collapses into
+                    // this one idle. The debt is left standing: a genuinely
+                    // separate trailer still absorbs the idle it belongs to,
+                    // and one that never comes is swept at the next `running`
+                    // transition.
+                    //
+                    // Via the subagent gate, not settleActive: a steered turn
+                    // can also have spawned background subagents, which own it
+                    // from here (settles now if none is live, holds otherwise).
+                    const steered: Turn = session.activeTurn;
+                    steered.deferredSettle = steered.steeredSettle;
+                    leaveSteerLane(steered);
+                    await settleDeferredIfDrained();
                   } else if (session.owedTrailingIdles > 0) {
                     // Absorb a settled turn's trailing idle. Also covers a
                     // cancel that landed between a turn's counted result and
                     // this lagged idle (no active turn to settle): the idle
                     // still belongs to that settled turn, and skipping the
                     // decrement would leak the debt permanently.
-                    // Deliberately BEFORE the steer lane below: an owed idle
-                    // belongs to an earlier turn, and reading it as the steered
-                    // sequence's turn-over signal would settle a turn whose
-                    // steered cycle is still running. Steered results owe none.
+                    // Deliberately BEFORE the not-ready steer lane below: an
+                    // owed idle belongs to an earlier turn, and it must not be
+                    // left to reach the #825 fail. Steered results owe none.
                     session.owedTrailingIdles--;
                   } else if (isSteering(session.activeTurn)) {
-                    // A steered turn settles here, not at a result: this idle is
-                    // the only signal spanning the interrupted and steered cycles
-                    // (see Turn.steeredEchoes). An idle before the steered echo,
-                    // or before any result was recorded, means the answer is
-                    // still ahead — swallow it, and never let it reach the #825
-                    // fail below, which would reject a prompt about to answer.
-                    //
-                    // Plain Turn so the fields can be cleared below; isSteering
-                    // narrows steeredEchoes to non-optional.
-                    const steered: Turn = session.activeTurn;
-                    if (steered.steeredEchoes?.size === 0 && steered.steeredSettle !== undefined) {
-                      // Via the subagent gate, not settleActive: a steered turn
-                      // can also have spawned background subagents, which own it
-                      // from here (settles now if none is live, holds otherwise).
-                      steered.deferredSettle = steered.steeredSettle;
-                      steered.steeredEchoes = undefined;
-                      steered.steeredSettle = undefined;
-                      await settleDeferredIfDrained();
-                    }
+                    // A steered turn whose answer is still ahead: an idle before
+                    // the steered echo, or before a result since it. Swallow it,
+                    // and never let it reach the #825 fail below, which would
+                    // reject a prompt about to answer.
                   } else if (
                     !session.cancelled &&
                     session.activeTurn &&
@@ -4549,6 +4793,7 @@ export class ClaudeAcpAgent {
                     },
                     supportsNotices,
                     transcriptText,
+                    { claudeCode: { kind: "informational", level: message.level } },
                   ),
                 });
                 const noticedTurn = session.activeTurn ?? session.turnQueue?.[0];
@@ -4894,6 +5139,29 @@ export class ClaudeAcpAgent {
               if (!isAutonomousResult) {
                 recordResultForOrphanCommands();
                 await ensureActiveTurn(message.user_message_uuid);
+                // A result that names a steer consumed it (see
+                // Turn.steeredEchoes), so the steered work is done: retire
+                // its echo — the CLI may never have replayed it — and, with
+                // no other steer outstanding, leave the steer lane so this
+                // result settles the turn through the ordinary lanes below
+                // and owes its trailing idle like any other. The interrupted
+                // cycle's result names only the send it was answering, so it
+                // stays on the steer lane. A cancelled turn's steers are
+                // cancel()'s to account for.
+                const steeredTurn = session.activeTurn;
+                if (!session.cancelled && isSteering(steeredTurn)) {
+                  const consumed =
+                    message.user_message_uuids ??
+                    (message.user_message_uuid !== undefined ? [message.user_message_uuid] : []);
+                  let answersSteer = false;
+                  for (const uuid of consumed) {
+                    steeredTurn.steeredEchoes.delete(uuid);
+                    if (steeredTurn.steeredUuids?.has(uuid)) answersSteer = true;
+                  }
+                  if (answersSteer && steeredTurn.steeredEchoes.size === 0) {
+                    leaveSteerLane(steeredTurn);
+                  }
+                }
                 // Once the submitted goal command has produced its own result,
                 // no older runtime update can still precede it in the ordered
                 // SDK stream. Stop suppressing updates even when this runtime
@@ -4904,7 +5172,9 @@ export class ClaudeAcpAgent {
                   const goalCommandFailed =
                     message.is_error ||
                     message.stop_reason === "refusal" ||
-                    ("result" in message && message.result.includes("Please run /login"));
+                    ("result" in message &&
+                      message.is_error &&
+                      message.result.includes("Please run /login"));
                   if (goalCommandFailed) {
                     await this.publishGoal(params.sessionId, pendingGoalUpdate.previous ?? null);
                   }
@@ -4959,7 +5229,9 @@ export class ClaudeAcpAgent {
               // Turn.steeredEchoes). One idle covers the whole interrupted +
               // steered sequence and that idle settles the turn, so counting
               // either result would leave a debt that swallows it. Autonomous
-              // results inside a steered turn keep their own trailers.
+              // results inside a steered turn keep their own trailers, and so
+              // does a result that named the steer: it took the turn out of the
+              // steer lane above and settles at the result, not the idle.
               const owesTrailingIdle = isAutonomousResult || !isSteering(session.activeTurn);
               if (
                 owesTrailingIdle &&
@@ -5052,7 +5324,7 @@ export class ClaudeAcpAgent {
               if (lastAssistantTotalUsage !== null) {
                 await sendUpdate({
                   sessionId: params.sessionId,
-                  update: {
+                  update: attachUsageModel({
                     sessionUpdate: "usage_update",
                     used: lastAssistantTotalUsage,
                     size: session.contextWindowSize,
@@ -5063,7 +5335,7 @@ export class ClaudeAcpAgent {
                     ...(message.origin && {
                       _meta: { "_claude/origin": message.origin },
                     }),
-                  },
+                  }),
                 });
               }
 
@@ -5093,6 +5365,44 @@ export class ClaudeAcpAgent {
               // failActive a live turn (the held one, or the user's next
               // prompt) whose own result recorded a different outcome.
               if (isAutonomousResult) {
+                // A held turn's followup can itself plan: the subagent
+                // finishes, the model writes the plan and calls ExitPlanMode
+                // inside the task-notification cycle, and the user answers it
+                // within the still-open turn. The interrupted cycle's
+                // diagnostic then carries that cycle's origin, so it lands
+                // here rather than in the user-lane check below — and settling
+                // the hold at it would end the turn with `end_turn`, silently
+                // dropping an accepted clear-context plan (issue #1167).
+                const heldTurn = session.activeTurn;
+                if (
+                  isHeldOpen(heldTurn) &&
+                  pendingExitPlanModeInterruption &&
+                  isExitPlanInterruptionResult(message, pendingExitPlanModeInterruption)
+                ) {
+                  session.pendingExitPlanModeInterruption = undefined;
+                  if (
+                    pendingExitPlanContextReset &&
+                    pendingExitPlanContextReset.toolUseId ===
+                      pendingExitPlanModeInterruption.toolUseId
+                  ) {
+                    // The fresh query has none of this one's background
+                    // tasks, so the hold can never drain there: drop it, and
+                    // let the continuation's own result settle the turn.
+                    (heldTurn as Turn).deferredSettle = undefined;
+                    await this.exitPlan.restart(
+                      params.sessionId,
+                      session,
+                      pendingExitPlanContextReset,
+                    );
+                    return;
+                  }
+                  // "No, keep planning": the turn ends cancelled, with the
+                  // usage its own result recorded — still held while other
+                  // subagents it spawned are live.
+                  session.pendingExitPlanContextReset = undefined;
+                  await settleOrDefer({ ...heldTurn.deferredSettle, stopReason: "cancelled" });
+                  break;
+                }
                 // CLI 2.1.274+ answers background-task completions that were
                 // already queued with ONE model call: every queued
                 // notification still gets its own result, but all except the
@@ -5171,14 +5481,9 @@ export class ClaudeAcpAgent {
               // interrupt as an error-shaped diagnostic, so translate only a
               // diagnostic causally paired with the recorded ExitPlanMode
               // permission response.
-              const diagnostic = executionDiagnostic(message);
               if (
                 pendingExitPlanModeInterruption &&
-                pendingExitPlanModeInterruption.toolResultSeen &&
-                message.is_error &&
-                diagnostic &&
-                /(?:^|\s)result_type=user(?:\s|$)/.test(diagnostic) &&
-                /(?:^|\s)stop_reason=tool_use(?:\s|$)/.test(diagnostic)
+                isExitPlanInterruptionResult(message, pendingExitPlanModeInterruption)
               ) {
                 session.pendingExitPlanModeInterruption = undefined;
                 if (
@@ -5265,7 +5570,7 @@ export class ClaudeAcpAgent {
 
               switch (message.subtype) {
                 case "success": {
-                  if (message.result.includes("Please run /login")) {
+                  if (message.is_error && message.result.includes("Please run /login")) {
                     await failActiveWithSessionFailure(
                       "auth_required",
                       RequestError.authRequired(),
@@ -5546,11 +5851,11 @@ export class ClaudeAcpAgent {
                 session.contextUsedTokens = nextUsage;
                 await sendUpdate({
                   sessionId: params.sessionId,
-                  update: {
+                  update: attachUsageModel({
                     sessionUpdate: "usage_update",
                     used: nextUsage,
                     size: session.contextWindowSize,
-                  },
+                  }),
                 });
               }
             }
@@ -5670,8 +5975,13 @@ export class ClaudeAcpAgent {
                 // none), but it marks the steered cycle as running — how the idle
                 // lane tells "the answer is still ahead" from "the turn is over"
                 // (see Turn.steeredEchoes).
-                if (isSteering(session.activeTurn)) {
-                  session.activeTurn.steeredEchoes.delete(message.uuid);
+                // The outcome recorded so far predates the steered cycle, so the
+                // idle lane waits for that cycle's own result.
+                if (
+                  isSteering(session.activeTurn) &&
+                  session.activeTurn.steeredEchoes.delete(message.uuid)
+                ) {
+                  session.activeTurn.steeredAwaitingResult = true;
                 }
                 // Unrelated replay (e.g. the echo of an already-settled turn).
                 break;
@@ -5701,10 +6011,17 @@ export class ClaudeAcpAgent {
             // next `result` can emit a usage_update tied to the right context
             // window. Subagent messages are excluded to keep the snapshot
             // aligned with what the user's current selection is producing.
+            // Synthetic frames (spend limits, sign-in prompts, local command
+            // output) are CLI-local banners with an all-zero usage object, not
+            // model responses, so they must not erase the last real context
+            // measurement. A turn with no real frame leaves the snapshot null
+            // and the result emits no usage_update, keeping the client's value.
             if (message.type === "assistant" && message.parent_tool_use_id === null) {
-              lastAssistantUsage = snapshotFromUsage(message.message.usage);
-              lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
-              session.contextUsedTokens = lastAssistantTotalUsage;
+              if (message.message.model !== "<synthetic>") {
+                lastAssistantUsage = snapshotFromUsage(message.message.usage);
+                lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
+                session.contextUsedTokens = lastAssistantTotalUsage;
+              }
               lastAssistantWasUsageLimit = isSyntheticUsageLimitMessage(message.message);
               if (message.error || lastAssistantWasUsageLimit) {
                 lastAssistantFailureTitle = assistantMessageText(message.message);
@@ -6019,12 +6336,12 @@ export class ClaudeAcpAgent {
             if (lastAssistantTotalUsage !== null) {
               await sendUpdate({
                 sessionId: message.session_id,
-                update: {
+                update: attachUsageModel({
                   sessionUpdate: "usage_update",
                   used: lastAssistantTotalUsage,
                   size: session.contextWindowSize,
                   _meta: { "_claude/rateLimit": message.rate_limit_info },
-                },
+                }),
               });
             }
             break;
@@ -7223,6 +7540,7 @@ export class ClaudeAcpAgent {
         allowPersistentOptions: !noPersistentRule,
         defaultToNo,
         availableModes: this.sessionModes.availableModeIds(session.modes),
+        prePlanMode: session.prePlanMode,
         contextUsedPercent:
           session.contextUsedTokens === undefined || session.contextWindowSize <= 0
             ? undefined
@@ -7260,6 +7578,21 @@ export class ClaudeAcpAgent {
       permissionResult = autoFallback.permissionResult;
       if (autoFallback.fallbackApplied) {
         await this.sessionModes.publishFallbackWarning(sessionId, session);
+      }
+      if (toolName === "ExitPlanMode" && permissionResult.behavior === "allow") {
+        const modeUpdate = permissionResult.updatedPermissions?.find(
+          (update) => update.type === "setMode" && update.destination === "session",
+        );
+        if (modeUpdate?.type === "setMode") {
+          try {
+            await this.sessionModes.publishCurrent(sessionId, modeUpdate.mode);
+            await this.updateConfigOption(sessionId, MODE_CONFIG_ID, modeUpdate.mode);
+          } catch (error) {
+            // The user already approved the plan; a failed notification must not
+            // turn that approval into a failed permission request.
+            this.logger.error("Failed to publish mode after plan approval:", error);
+          }
+        }
       }
       const clearContextMode = decodedPermission.contextResetMode
         ? this.sessionModes.effectiveMode(session, decodedPermission.contextResetMode)
@@ -7721,8 +8054,9 @@ export class ClaudeAcpAgent {
       }
 
       // Session-defining params changed (e.g. cwd pointed at a git worktree,
-      // or MCP servers reconfigured). Tear down the existing session and
-      // recreate it so the underlying Query process picks up the new values.
+      // MCP servers reconfigured, or the skill set changed). Tear down the
+      // existing session and recreate it so the underlying Query process picks
+      // up the new values.
       await this.teardownSession(params.sessionId);
     }
 
@@ -7896,11 +8230,14 @@ export class ClaudeAcpAgent {
 
     // Extract options from _meta if provided
     const sessionMeta = params._meta as NewSessionMeta | undefined;
-    // Bypass is off for root outside a sandbox, and hosts may opt a session out.
-    // Decided once here: it gates the SDK flag, the spawn-time mode (the SDK
-    // rejects bypassPermissions without the flag), and the mode catalog.
+    // Bypass is off for root outside a sandbox, when settings disable it (the
+    // CLI refuses bypass then too), and hosts may opt a session out. Decided
+    // once here: it gates the SDK flag, the spawn-time mode (the SDK rejects
+    // bypassPermissions without the flag), and the mode catalog.
     const allowBypass =
-      ALLOW_BYPASS && sessionMeta?.claudeCode?.options?.allowDangerouslySkipPermissions !== false;
+      ALLOW_BYPASS &&
+      settingsManager.getSettings().permissions?.disableBypassPermissionsMode !== "disable" &&
+      sessionMeta?.claudeCode?.options?.allowDangerouslySkipPermissions !== false;
 
     const initialPermissionMode = resolvePermissionMode(
       creationOpts.permissionMode ?? settingsManager.getSettings().permissions?.defaultMode,
@@ -8831,10 +9168,16 @@ function createEnvForProvider(config: ProviderConfig | null): Record<string, str
   if (config.apiType === "vertex") {
     // `config.vertex` is guaranteed present for vertex by `unstable_setProvider`
     // validation; fall back to empty strings defensively.
+    // Leaving ANTHROPIC_VERTEX_BASE_URL empty for the default endpoint lets
+    // Claude Code use its native Vertex endpoint/model resolution. Supplying
+    // even the default host marks the session as a custom Vertex deployment and
+    // can hide otherwise-valid models.
     return {
       ...resetRouting,
       CLAUDE_CODE_USE_VERTEX: "1",
-      ANTHROPIC_VERTEX_BASE_URL: config.baseUrl,
+      ...(config.baseUrl !== DEFAULT_VERTEX_BASE_URL
+        ? { ANTHROPIC_VERTEX_BASE_URL: config.baseUrl }
+        : {}),
       ANTHROPIC_VERTEX_PROJECT_ID: config.vertex?.projectId ?? "",
       CLOUD_ML_REGION: config.vertex?.region ?? "",
       ANTHROPIC_CUSTOM_HEADERS: customHeaders,
