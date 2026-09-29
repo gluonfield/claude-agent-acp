@@ -1131,7 +1131,7 @@ describe("session config options", () => {
       // getContextUsage stalls until the session's first prompt turn, so the
       // switch path must never call it; modelUsage supplies the window later.
       const session = getSession();
-      session.query.getContextUsage = vi.fn(async () => ({ rawMaxTokens: 967000 }));
+      session.query.getContextUsage = vi.fn(() => new Promise<never>(() => {}));
       session.modelInfos = session.modelInfos.map((m: ModelInfo) =>
         m.value === "claude-sonnet-4-6" ? { ...m, resolvedModel: "claude-sonnet-5[1m]" } : m,
       );
@@ -1160,20 +1160,6 @@ describe("session config options", () => {
 
       expect(session.query.getContextUsage).not.toHaveBeenCalled();
       expect(session.contextWindowSize).toBe(0);
-    });
-
-    it("does not call getContextUsage even when switching to a fresh model", async () => {
-      const session = getSession();
-      const spy = vi.fn(async () => ({ rawMaxTokens: 967000 }));
-      session.query.getContextUsage = spy;
-
-      await agent.setSessionConfigOption({
-        sessionId: SESSION_ID,
-        configId: "model",
-        value: "claude-sonnet-4-6",
-      });
-
-      expect(spy).not.toHaveBeenCalled();
     });
 
     it("keeps the learned window when re-asserting the current model", async () => {
