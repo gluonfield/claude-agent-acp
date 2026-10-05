@@ -675,13 +675,13 @@ describe("session config options", () => {
       expect(applyFlagSettingsSpy).not.toHaveBeenCalled();
     });
 
-    it("clears an unsupported user pin and leaves persisted effort with the SDK", async () => {
+    it.each([false, true])("clears an unsupported user pin with ultracode=%s", async (ultracode) => {
       (agent as any).clientCapabilities = {
         _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
       };
       const session = agent.sessions[SESSION_ID];
       session.modelInfos[0].supportedEffortLevels = ["low", "medium", "high", "max"];
-      session.settingsManager.getSettings = () => ({ effortLevel: "low" });
+      session.settingsManager.getSettings = () => ({ effortLevel: "low", ultracode });
       session.configOptions.find((o) => o.id === "effort")!.currentValue = "max";
       session.effortPinnedLevel = "max";
       const response = await agent.setSessionConfigOption({
@@ -690,7 +690,10 @@ describe("session config options", () => {
         value: "claude-sonnet-4-6",
       });
       expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
-      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: null });
+      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({
+        effortLevel: null,
+        ...(ultracode ? { ultracode: true } : {}),
+      });
       expect(session.effortPinnedLevel).toBeUndefined();
     });
 
