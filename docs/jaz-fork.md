@@ -37,23 +37,29 @@ the RFD to a client with AIR extensions or Jaz no longer needs them. Then delete
 
 ## Native parity, 0.93.0-jaz.1
 
-Validated on macOS arm64 on 2026-10-18 with the subscription OAuth profile Jaz uses, against the
-released 0.89.1-jaz.2. The probe declares Jaz's client capabilities, selects `opus[1m]`, and asks
-Claude to read a fixture with its file tool. No API key was used.
+Validated on macOS arm64 on 2026-10-18 with the subscription OAuth profile Jaz uses. No API key
+was used. Each run selects `opus[1m]` and asks Claude to read a fixture with its file tool; the ACP
+runs declare Jaz's client capabilities.
 
-| Check                               | 0.89.1-jaz.2             | 0.93.0-jaz.1                |
-| ----------------------------------- | ------------------------ | --------------------------- |
-| Claude Code                         | 2.1.296                  | 2.1.300                     |
-| Claude Code arguments and env names | identical                | identical                   |
-| Model                               | `claude-opus-5-5`, 1M    | `claude-opus-5-5`, 1M       |
-| Context window shown                | unknown, then 1,000,000  | unknown, then 1,000,000     |
-| Tools and agents                    | 28 tools, 5 agents       | the same 28 tools, 5 agents |
-| First user prompt                   | one, 107 bytes           | one, 107 bytes              |
-| First turn input, including cache   | 55,607 tokens            | 55,835 tokens               |
-| File read                           | fixture token            | fixture token               |
-| Authentication                      | subscription, no API key | subscription, no API key    |
+| Check                             | Claude Code 2.1.300, `-p` | 0.93.0-jaz.1             | 0.89.1-jaz.2             |
+| --------------------------------- | ------------------------- | ------------------------ | ------------------------ |
+| Claude Code                       | 2.1.300                   | 2.1.300                  | 2.1.296                  |
+| Model                             | `claude-opus-5-5[1m]`     | `claude-opus-5-5[1m]`    | `claude-opus-5-5[1m]`    |
+| Context window                    | 1,000,000                 | unknown, then 1,000,000  | unknown, then 1,000,000  |
+| Tools                             | 39                        | 28                       | the same 28              |
+| First user prompt                 | one, the same text        | one, the same text       | one, the same text       |
+| First turn input, including cache | 54,132 tokens             | 55,835 tokens            | 55,607 tokens            |
+| File read                         | fixture token             | fixture token            | fixture token            |
+| Resume in a fresh process, recall | fixture token             | fixture token            | not rerun                |
+| `/compact`, then recall           | fixture token             | fixture token            | not rerun                |
+| Authentication                    | subscription, no API key  | subscription, no API key | subscription, no API key |
 
-The 228-token difference is Claude Code's: 0.89.1-jaz.2 running Claude Code 2.1.300 sends the same
-55,835. The only other difference in what the adapter sends Claude Code is `promptSuggestions: true`
-in its `initialize` request, upstream's default since 0.92.0. Over three turns with suggestions on,
-Claude Code 2.1.300 sent no suggestion and used the same tokens as with them off.
+The adapters pass Claude Code identical arguments and environment variable names. The tool sets
+differ by mode: headless `-p` drops AskUserQuestion, EnterPlanMode and ExitPlanMode, which an ACP
+host keeps, and lists the claude.ai MCP tools that had connected before its first turn. The
+228-token difference between the adapters is Claude Code's: in a paired run, 0.89.1-jaz.2 driving
+Claude Code 2.1.300 sent the same 55,793 tokens as 0.93.0-jaz.1.
+
+The only other difference in what the adapter sends Claude Code is `promptSuggestions: true` in its
+`initialize` request, upstream's default since 0.92.0. Over three turns with suggestions on, Claude
+Code 2.1.300 sent no suggestion and used the same tokens as with them off.
