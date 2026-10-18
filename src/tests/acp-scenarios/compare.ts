@@ -102,8 +102,9 @@ export function withoutAirOnlyKeys(value: unknown): unknown {
 
 /**
  * The Jaz fork's intended differences from upstream: the MCP refresh
- * capability, the `_meta.jaz` subagent record, and a context window that stays
- * unknown (`size: 0`, no used share) until the provider reports it.
+ * capability and a context window that stays unknown (`size: 0`, no used
+ * share) until the provider reports it. The Jaz subagent records are extra
+ * updates; see {@link isJazSubagentRecord}.
  */
 function withoutJazForkDifferences(record: Recorded): Recorded {
   const copy = structuredClone(record) as Recorded & { payload: Json };
@@ -111,14 +112,24 @@ function withoutJazForkDifferences(record: Recorded): Recorded {
     Json | undefined;
   delete capabilities?.mcpRefresh;
   const update = updateOf(copy);
-  delete (update?._meta as Json | undefined)?.jaz;
-  if (update?._meta && Object.keys(update._meta as Json).length === 0) delete update._meta;
   if (update?.sessionUpdate === "usage_update") delete update.size;
   // An unknown window has no used share for the clear-context option label.
   for (const option of (copy.payload.options as Json[] | undefined) ?? []) {
     option.name = (option.name as string).replace(/ \(\d+% used\)/, "");
   }
   return copy;
+}
+
+/** A Jaz subagent record: a `session_info_update` that carries only `_meta.jaz`. */
+function isJazSubagentRecord(record: Recorded): boolean {
+  const update = updateOf(record);
+  const meta = update?._meta as Json | undefined;
+  return (
+    update?.sessionUpdate === "session_info_update" &&
+    Object.keys(update).length === 2 &&
+    meta !== undefined &&
+    Object.keys(meta).join() === "jaz"
+  );
 }
 
 /** The replaced fields and the merged `_meta` keys of a tool call report, as JSON. */
@@ -224,7 +235,7 @@ function isMeta(key: string): boolean {
  * the compatibility rule does not allow. An empty list means compatible.
  */
 export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): string[] {
-  current = current.map(withoutJazForkDifferences);
+  current = current.filter((record) => !isJazSubagentRecord(record)).map(withoutJazForkDifferences);
   const expected = baseline
     .map(withoutJazForkDifferences)
     .map((record) => withoutAirOnlyKeys(record) as Recorded)

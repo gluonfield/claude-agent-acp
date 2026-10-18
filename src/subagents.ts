@@ -1,55 +1,155 @@
-import type { AgentInput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import type { SessionNotification } from "@agentclientprotocol/sdk";
+import type {
+  SDKTaskNotificationMessage,
+  SDKTaskProgressMessage,
+  SDKTaskStartedMessage,
+  SDKTaskUpdatedMessage,
+} from "@anthropic-ai/claude-agent-sdk";
+import { isSubagentTask } from "./async-tasks.js";
 
-type Update = SessionNotification["update"];
+type SubagentStatus = "running" | "completed" | "failed" | "cancelled";
 
+/** The Jaz Subtasks record of one Claude subagent, keyed by the id of the Agent tool call that spawned it. */
 export type JazProviderSubagent = {
   provider: "claude";
   id: string;
-  status: "running" | "completed" | "failed";
+  status: SubagentStatus;
   name?: string;
   role?: string;
   prompt?: string;
-  model?: string;
   summary?: string;
 };
 
-const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
+type TrackedSubagent = {
+  /** The record id: the spawning tool call, or the task id when the SDK names none. */
+  id: string;
+  status: SubagentStatus;
+  summary?: string;
+};
 
-export function jazProviderSubagent(
-  update: Update,
-  parentToolUseId: string | null | undefined,
-): JazProviderSubagent | null {
-  if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
-    return null;
-  }
-  if (parentToolUseId) {
-    const summary = typeof update.title === "string" ? update.title.trim() : "";
-    return {
-      provider: "claude",
-      id: parentToolUseId,
+/**
+ * Reports Claude subagents to Jaz from the SDK task lifecycle: identity from
+ * `task_started`, activity from `task_progress`, and the end from
+ * `task_notification` or a terminal `task_updated` patch. Each change goes out
+ * as a `session_info_update` that carries only `_meta.jaz.providerSubagent`.
+ */
+export class JazSubagentReporter {
+  /** Subagent tasks by task id. `task_updated` names only the task. */
+  private readonly tasks = new Map<string, TrackedSubagent>();
+
+  constructor(
+    private readonly sessionId: string,
+    private readonly send: (notification: SessionNotification) => Promise<void>,
+  ) {}
+
+  async taskStarted(message: SDKTaskStartedMessage): Promise<void> {
+    if (!isSubagentTask(message)) {
+      return;
+    }
+    // A resumed agent keeps the record of its first run.
+    const previous = this.tasks.get(message.task_id);
+    const task: TrackedSubagent = {
+      id: previous?.id ?? message.tool_use_id ?? message.task_id,
       status: "running",
-      ...(summary ? { summary } : {}),
     };
+    this.tasks.set(message.task_id, task);
+    const name = nonBlank(message.description);
+    const role = nonBlank(message.subagent_type);
+    const prompt = nonBlank(message.prompt);
+    await this.publish({
+      provider: "claude",
+      id: task.id,
+      status: "running",
+      ...(name ? { name } : {}),
+      ...(role ? { role } : {}),
+      ...(prompt ? { prompt } : {}),
+    });
   }
-  const toolName = (update._meta as { claudeCode?: { toolName?: string } } | undefined)?.claudeCode
-    ?.toolName;
-  if (!toolName || !SUBAGENT_TOOLS.has(toolName) || !update.toolCallId) return null;
 
-  const input = (update.rawInput ?? {}) as Partial<AgentInput>;
-  return {
-    provider: "claude",
-    id: update.toolCallId,
-    status: subagentStatus(update.status),
-    ...(input.description ? { name: input.description } : {}),
-    ...(input.subagent_type ? { role: input.subagent_type } : {}),
-    ...(input.prompt ? { prompt: input.prompt } : {}),
-    ...(input.model ? { model: input.model } : {}),
-  };
+  async taskProgress(message: SDKTaskProgressMessage): Promise<void> {
+    const task = this.tasks.get(message.task_id);
+    if (!task || task.status !== "running") {
+      return;
+    }
+    const summary = nonBlank(message.summary) ?? nonBlank(message.last_tool_name);
+    if (!summary || summary === task.summary) {
+      return;
+    }
+    await this.publish({ provider: "claude", id: task.id, status: "running", summary });
+    task.summary = summary;
+  }
+
+  async taskNotification(message: SDKTaskNotificationMessage): Promise<void> {
+    await this.setStatus(
+      message.task_id,
+      message.status === "stopped" ? "cancelled" : message.status,
+    );
+  }
+
+  async taskUpdated(message: SDKTaskUpdatedMessage): Promise<void> {
+    const status = patchStatus(message.patch.status);
+    if (status) {
+      await this.setStatus(message.task_id, status);
+    }
+  }
+
+  /** Ends every running agent: the Claude stream ended with them. */
+  async finishAll(status: "failed" | "cancelled"): Promise<void> {
+    const errors: unknown[] = [];
+    for (const [taskId, task] of this.tasks) {
+      if (task.status !== "running") {
+        continue;
+      }
+      try {
+        await this.setStatus(taskId, status);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, "Failed to publish Jaz subagent state");
+    }
+  }
+
+  /** Forgets every task: a new conversation starts its own task ids. */
+  clear(): void {
+    this.tasks.clear();
+  }
+
+  private async setStatus(taskId: string, status: SubagentStatus): Promise<void> {
+    const task = this.tasks.get(taskId);
+    if (!task || task.status === status) {
+      return;
+    }
+    await this.publish({ provider: "claude", id: task.id, status });
+    task.status = status;
+  }
+
+  private async publish(providerSubagent: JazProviderSubagent): Promise<void> {
+    await this.send({
+      sessionId: this.sessionId,
+      update: { sessionUpdate: "session_info_update", _meta: { jaz: { providerSubagent } } },
+    });
+  }
 }
 
-function subagentStatus(status: string | null | undefined): JazProviderSubagent["status"] {
-  if (status === "completed") return "completed";
-  if (status === "failed") return "failed";
-  return "running";
+/** The SDK resumes a finished subagent under the same task id with a running patch. */
+function patchStatus(status: SDKTaskUpdatedMessage["patch"]["status"]): SubagentStatus | undefined {
+  switch (status) {
+    case "pending":
+    case "running":
+      return "running";
+    case "completed":
+    case "failed":
+      return status;
+    case "killed":
+      return "cancelled";
+    default:
+      return undefined;
+  }
+}
+
+function nonBlank(value: string | undefined): string | undefined {
+  const text = value?.trim();
+  return text ? text : undefined;
 }

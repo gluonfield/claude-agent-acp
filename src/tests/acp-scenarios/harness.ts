@@ -361,10 +361,13 @@ export async function runScenario(
     sessionId = acpSessionId;
     await settle();
     for (let turn = 0; turn < scenario.turns.length; turn++) {
-      const response = await agent.prompt({
-        sessionId: acpSessionId,
-        prompt: [{ type: "text", text: scenario.prompts?.[turn] ?? `prompt ${turn + 1}` }],
-      });
+      // A failed prompt, for example after the Claude process died, records its error.
+      const response = await agent
+        .prompt({
+          sessionId: acpSessionId,
+          prompt: [{ type: "text", text: scenario.prompts?.[turn] ?? `prompt ${turn + 1}` }],
+        })
+        .catch((error: unknown) => ({ error: String(error) }));
       record("promptResponse", response);
       await settle();
     }

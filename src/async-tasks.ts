@@ -992,7 +992,7 @@ function isMonitorTask(message: AsyncTaskStarted): boolean {
   return field(message, "taskType", "task_type") === "local_monitor";
 }
 
-function isSubagentTask(message: AsyncTaskStarted): boolean {
+export function isSubagentTask(message: AsyncTaskStarted): boolean {
   return (
     field(message, "subagentType", "subagent_type") !== undefined ||
     field(message, "taskType", "task_type") === "local_agent"

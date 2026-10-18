@@ -199,7 +199,7 @@ import {
 } from "./permissions/presentation.js";
 import { decodeClaudePermissionResponse } from "./permissions/response.js";
 import { SettingsManager } from "./settings.js";
-import { jazProviderSubagent } from "./subagents.js";
+import { JazSubagentReporter } from "./subagents.js";
 import {
   activeUsageLimitMessage,
   airSessionFailureCapabilityMeta,
@@ -1186,6 +1186,8 @@ export type Session = {
   /** Session-owned async task controller. Prompt cancellation intentionally
    *  does not finish it because background work may outlive a prompt. */
   asyncTaskRuntime?: AsyncTaskRuntime;
+  /** Session-owned Jaz Subtasks reporter; background subagents outlive a prompt. */
+  jazSubagentReporter?: JazSubagentReporter;
   /** The consumer's compaction lifecycle, exposed so the PostCompact hook can
    *  hand it the retained summary. */
   contextCompaction?: ContextCompactionLifecycle;
@@ -4025,6 +4027,15 @@ export class ClaudeAcpAgent {
       },
     ));
 
+    // A client with native subagent sessions gets the subagent lifecycle from
+    // subagent_spawned and subagent_state_update instead.
+    const jazSubagents = subagents.enabled
+      ? undefined
+      : (session.jazSubagentReporter ??= new JazSubagentReporter(
+          params.sessionId,
+          async (notification) => this.client.sessionUpdate(notification),
+        ));
+
     const compaction = new ContextCompactionLifecycle((notification) => sendUpdate(notification), {
       sessionId: params.sessionId,
       airClient: this.toolCallCapabilities.air.client,
@@ -4127,6 +4138,14 @@ export class ClaudeAcpAgent {
           .catch((error) =>
             this.logger.error(
               `Session ${params.sessionId}: failed to publish terminal async task state ${context}`,
+              error,
+            ),
+          ),
+        jazSubagents
+          ?.finishAll(nativeState === "cancelled" ? "cancelled" : "failed")
+          .catch((error) =>
+            this.logger.error(
+              `Session ${params.sessionId}: failed to publish terminal Jaz subagent state ${context}`,
               error,
             ),
           ),
@@ -5596,6 +5615,7 @@ export class ClaudeAcpAgent {
                   );
                   break;
                 }
+                await jazSubagents?.taskProgress(message);
                 await asyncTasks.taskProgress({
                   task_id: message.task_id,
                   description: message.description,
@@ -5641,6 +5661,7 @@ export class ClaudeAcpAgent {
                   },
                   sendUpdate,
                 );
+                await jazSubagents?.taskStarted(message);
                 await asyncTasks.taskStarted({
                   task_id: message.task_id,
                   task_type: message.task_type,
@@ -5667,6 +5688,7 @@ export class ClaudeAcpAgent {
                   sendUpdate,
                   message.tool_use_id,
                 );
+                await jazSubagents?.taskNotification(message);
                 await asyncTasks.taskNotification({
                   task_id: message.task_id,
                   status: message.status,
@@ -5688,6 +5710,7 @@ export class ClaudeAcpAgent {
                   );
                   break;
                 }
+                await jazSubagents?.taskUpdated(message);
                 await asyncTasks.taskUpdated(message.task_id, message.patch);
                 // terminal-status task_updated patch and a (deduplicated)
                 // task_notification when a task settles, but only the patch is
@@ -7169,6 +7192,7 @@ export class ClaudeAcpAgent {
             await finishLifecycle("failed", "failed", "during conversation reset");
             subagents.clear();
             asyncTasks.clear();
+            jazSubagents?.clear();
             session.resolvedToolNames?.clear();
             session.eagerToolCallSessions?.clear();
             session.toolCallFields?.clear();
@@ -11360,13 +11384,6 @@ export function toAcpNotifications(
     }
     if (update) {
       if (options?.parentToolUseId) stampParentToolUseId(update, options.parentToolUseId);
-      const providerSubagent = jazProviderSubagent(update, options?.parentToolUseId);
-      if (providerSubagent) {
-        update._meta = {
-          ...update._meta,
-          jaz: { providerSubagent },
-        };
-      }
       applyMessageId(update, options?.messageId);
       // A tool result is final, so it may replace a pinned approval patch,
       // for example with the error text of a rejected Edit.
