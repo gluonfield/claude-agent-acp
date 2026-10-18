@@ -4537,6 +4537,8 @@ export class ClaudeAcpAgent {
       : (session.jazSubagentReporter ??= new JazSubagentReporter(
           params.sessionId,
           async (notification) => this.client.sessionUpdate(notification),
+          (toolCallId) =>
+            session.toolUseCache[toolCallId]?.name ?? session.resolvedToolNames?.get(toolCallId),
         ));
 
     const compaction = new ContextCompactionLifecycle((notification) => sendUpdate(notification), {

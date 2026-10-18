@@ -6,10 +6,11 @@ import type {
   SDKTaskUpdatedMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { isSubagentTask } from "./async-tasks.js";
+import { isNativeSubagentControlTool } from "./native-subagents.js";
 
-/** `interrupted`: the agent stopped running for a reason Claude Code did not
- *  report, such as the Claude process exiting or restarting. */
-type SubagentStatus = "running" | "completed" | "failed" | "cancelled" | "interrupted";
+/** `cancelled` also covers an agent that stopped for a reason Claude Code did
+ *  not report, as Jaz closes an agent whose process went away. */
+type SubagentStatus = "running" | "completed" | "failed" | "cancelled";
 
 /** The Jaz Subtasks record of one Claude subagent, keyed by its agent id (the
  *  SDK task id), which a resumed agent keeps, also after an adapter restart. */
@@ -42,6 +43,7 @@ export class JazSubagentReporter {
   constructor(
     private readonly sessionId: string,
     private readonly send: (notification: SessionNotification) => Promise<void>,
+    private readonly toolNameOf: (toolCallId: string) => string | undefined,
   ) {}
 
   async taskStarted(message: SDKTaskStartedMessage): Promise<void> {
@@ -49,6 +51,13 @@ export class JazSubagentReporter {
       return;
     }
     this.tasks.set(message.task_id, { status: "running" });
+    // A SendMessage that resumes an agent, also one that an earlier adapter
+    // process launched, keeps the name and prompt of the Agent call.
+    const launcher = message.tool_use_id ? this.toolNameOf(message.tool_use_id) : undefined;
+    if (launcher !== undefined && !isNativeSubagentControlTool(launcher)) {
+      await this.publish({ provider: "claude", id: message.task_id, status: "running" });
+      return;
+    }
     const name = nonBlank(message.description);
     const role = nonBlank(message.subagent_type);
     const prompt = nonBlank(message.prompt);
@@ -76,7 +85,10 @@ export class JazSubagentReporter {
   }
 
   async taskNotification(message: SDKTaskNotificationMessage): Promise<void> {
-    await this.setStatus(message.task_id, notificationStatus(message));
+    await this.setStatus(
+      message.task_id,
+      message.status === "stopped" ? "cancelled" : message.status,
+    );
   }
 
   async taskUpdated(message: SDKTaskUpdatedMessage): Promise<void> {
@@ -94,7 +106,7 @@ export class JazSubagentReporter {
         continue;
       }
       try {
-        await this.setStatus(taskId, "interrupted");
+        await this.setStatus(taskId, "cancelled");
       } catch (error) {
         errors.push(error);
       }
@@ -124,14 +136,6 @@ export class JazSubagentReporter {
       update: { sessionUpdate: "session_info_update", _meta: { jaz: { providerSubagent } } },
     });
   }
-}
-
-function notificationStatus(message: SDKTaskNotificationMessage): SubagentStatus {
-  if (message.status !== "stopped") {
-    return message.status;
-  }
-  // A worker restart found the task orphaned; nobody stopped it.
-  return message.reason === "worker_restart" ? "interrupted" : "cancelled";
 }
 
 /** The SDK resumes a finished subagent under the same task id with a running patch. */

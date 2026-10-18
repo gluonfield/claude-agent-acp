@@ -265,25 +265,6 @@ const scenarios: Scenario[] = [
     ],
   },
   {
-    // The Claude worker restarted and found the agent orphaned.
-    name: "worker-restart",
-    turns: [
-      async function* (ctx) {
-        yield* toolCall(
-          ctx,
-          { id: "toolu_orphan", name: "Agent", input: { ...background, run_in_background: true } },
-          asyncLaunch("agent_orphan", background),
-        );
-        yield taskStarted("agent_orphan", "toolu_orphan", background, { is_backgrounded: true });
-        yield taskNotification("agent_orphan", "toolu_orphan", "stopped", {
-          reason: "worker_restart",
-        });
-        yield result();
-        yield idle();
-      },
-    ],
-  },
-  {
     // After an adapter restart, SendMessage resumes an agent of an earlier
     // process: Claude registers it again under the SendMessage call.
     name: "resumed-after-restart",
@@ -517,32 +498,25 @@ describe("Jaz subagent records", () => {
     expect(subagentRecords("background-bash")).toEqual([]);
   });
 
-  it("interrupts running agents on a conversation reset and ignores their late reports", () => {
+  it("cancels running agents on a conversation reset and ignores their late reports", () => {
     expect(subagentRecords("conversation-reset")).toEqual([
       identity("agent_before", background),
-      { provider: "claude", id: "agent_before", status: "interrupted" },
+      { provider: "claude", id: "agent_before", status: "cancelled" },
       identity("agent_after", foreground),
       { provider: "claude", id: "agent_after", status: "completed" },
     ]);
   });
 
-  it("interrupts a running agent when the Claude process dies", () => {
+  it("cancels a running agent when the Claude process dies", () => {
     expect(subagentRecords("process-died")).toEqual([
       identity("agent_died", foreground),
-      { provider: "claude", id: "agent_died", status: "interrupted" },
+      { provider: "claude", id: "agent_died", status: "cancelled" },
     ]);
   });
 
-  it("reports an agent that a worker restart orphaned as interrupted, not cancelled", () => {
-    expect(subagentRecords("worker-restart")).toEqual([
-      identity("agent_orphan", background),
-      { provider: "claude", id: "agent_orphan", status: "interrupted" },
-    ]);
-  });
-
-  it("keeps an agent's record when SendMessage resumes it after an adapter restart", () => {
+  it("keeps an agent's record and launch prompt when SendMessage resumes it after an adapter restart", () => {
     expect(subagentRecords("resumed-after-restart")).toEqual([
-      identity("agent_old", { ...background, prompt: "Go on" }),
+      { provider: "claude", id: "agent_old", status: "running" },
       { provider: "claude", id: "agent_old", status: "completed" },
     ]);
   });

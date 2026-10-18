@@ -139,6 +139,16 @@ function isJazSubagentRecord(record: Recorded): boolean {
   );
 }
 
+/** Both sides without the Jaz fork's intended differences. */
+function withoutJazFork(baseline: Recorded[], traffic: Recorded[]) {
+  return {
+    baseline: baseline.map(withoutJazForkDifferences),
+    traffic: traffic
+      .filter((record) => !isJazSubagentRecord(record))
+      .map(withoutJazForkDifferences),
+  };
+}
+
 /** The replaced fields and the merged `_meta` keys of a tool call report, as JSON. */
 function flatten(update: Json): Map<string, string> {
   const flat = new Map<string, string>();
@@ -258,17 +268,14 @@ function withoutSessionCapability(record: Recorded, key: string): Recorded {
  * the compatibility rule does not allow. An empty list means compatible.
  */
 export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): string[] {
+  ({ baseline, traffic } = withoutJazFork(baseline, traffic));
   const expected = baseline
-    .map(withoutJazForkDifferences)
     .map((record) => withoutSessionCapability(withoutAirOnlyKeys(record) as Recorded, "subagents"))
     .filter((record) => {
       const update = updateOf(record);
       return !(update?.sessionUpdate === "session_info_update" && Object.keys(update).length === 1);
     });
-  const current = traffic
-    .filter((record) => !isJazSubagentRecord(record))
-    .map(withoutJazForkDifferences)
-    .map((record) => withoutSessionCapability(record, "systemPrompt"));
+  const current = traffic.map((record) => withoutSessionCapability(record, "systemPrompt"));
   const violations: string[] = [];
   const state = new Map<string, Map<string, string>>();
   const summaryChunks = new Map<string, string>();
