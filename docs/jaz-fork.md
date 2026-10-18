@@ -61,5 +61,11 @@ host keeps, and lists the claude.ai MCP tools that had connected before its firs
 Claude Code 2.1.300 sent the same 55,793 tokens as 0.93.0-jaz.1.
 
 The only other difference in what the adapter sends Claude Code is `promptSuggestions: true` in its
-`initialize` request, upstream's default since 0.92.0. Over three turns with suggestions on, Claude
-Code 2.1.300 sent no suggestion and used the same tokens as with them off.
+`initialize` request, upstream's default since 0.92.0. Claude Code 2.1.300 skips a suggestion while
+the conversation has fewer than two assistant messages, after an API error, in plan mode or with a
+permission pending, when its rate limit is not "allowed", and after a turn of more than 10k tokens.
+Otherwise it makes one extra request (`source=prompt_suggestion`) over the cached prefix, about
+$0.01 per turn at 33k context, and the adapter forwards the result to AIR clients as
+`session_info_update._meta.promptSuggestions`. In nine live turns four suggestions survived its
+filters. An earlier three-turn probe saw none because every turn hit a gate, and it compared totals
+that leave out the request after the last turn. Jaz shows the suggestion as composer ghost text.
