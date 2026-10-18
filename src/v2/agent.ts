@@ -19,9 +19,9 @@ import type { AcpSessionNotification } from "../acp-subagents.js";
 import type { AcpPermissionRequest } from "../permissions/presentation.js";
 import { v1InitializeRequest, v2InitializeResponse } from "./initialize.js";
 import { v1PermissionResponse, v2PermissionRequest } from "./permission.js";
-import { v2Prompt } from "./prompt.js";
+import { v2Foreground, v2Prompt } from "./prompt.js";
 import {
-  v1ForkSessionRequests,
+  v1ForkSessionRequest,
   v1NewSessionRequest,
   v1RestoreSessionRequest,
   v1SetSessionConfigOptionRequest,
@@ -30,8 +30,9 @@ import {
   v2NewSessionResponse,
   v2ResumeSessionResponse,
 } from "./session.js";
-import { v2SessionUpdate } from "./session-update.js";
+import { v2ChildStateUpdate, v2SessionUpdate } from "./session-update.js";
 import { V2Terminals } from "./terminal.js";
+import { V2ToolCallMeta } from "./tool-call-meta.js";
 
 /**
  * The ACP v2 surface, for one connection.
@@ -52,7 +53,13 @@ export function v2AgentApp(
     .agent({ name: "claude-code-acp" })
     .onConnect((connection) => {
       client = new V2ClientConnection(connection.client, logger ?? console);
-      agent = new ClaudeAcpAgent(client, logger, { v2: true });
+      agent = new ClaudeAcpAgent(client, logger, {
+        v2: true,
+        foreground: (sessionId) =>
+          v2Foreground((update) => {
+            void client.send({ sessionId, update });
+          }),
+      });
       onAgent(agent);
     })
     .onRequest(v2.methods.agent.initialize, async ({ params }) =>
@@ -81,23 +88,33 @@ export function v2AgentApp(
         restore.method === "resume"
           ? await agent.resumeSession(restore.request)
           : await client.replaying(params.sessionId, () => agent.loadSession(restore.request));
+      // v2 requires a snapshot of the foreground state after the replay and
+      // before the response, also without a replay: a resumed live session can
+      // be running a turn, or waiting on a permission request.
+      void client.send({
+        sessionId: params.sessionId,
+        update: stateSnapshot(agent.foregroundState(params.sessionId)),
+      });
       return {
         ...v2ResumeSessionResponse(response),
         ...(await setupCommands(agent, params.sessionId, logger)),
       };
     })
-    .onRequest(v2.methods.agent.session.fork, async ({ params }) => {
-      const requests = v1ForkSessionRequests(params);
-      const { sessionId } = await agent.unstable_forkSession(requests.fork);
-      return {
-        sessionId,
-        ...v2ResumeSessionResponse(await agent.resumeSession(requests.resume(sessionId))),
-        ...(await setupCommands(agent, sessionId, logger)),
-      };
-    })
+    .onRequest(v2.methods.agent.session.fork, ({ params }) =>
+      agent.forking(params.sessionId, async () => {
+        // The agent starts the forked session, so the client can prompt it.
+        const response = await agent.unstable_forkSession(v1ForkSessionRequest(params));
+        return {
+          sessionId: response.sessionId,
+          ...v2ResumeSessionResponse(response),
+          ...(await setupCommands(agent, response.sessionId, logger)),
+        };
+      }),
+    )
     .onRequest(v2.methods.agent.session.close, async ({ params }) => {
       const response = await agent.closeSession(params);
       client.terminals.forget(params.sessionId);
+      client.toolCallMeta.forget(params.sessionId);
       return response;
     })
     .onRequest(v2.methods.agent.session.delete, ({ params }) => agent.deleteSession(params))
@@ -113,6 +130,13 @@ export function v2AgentApp(
       }),
     )
     .onNotification(v2.methods.agent.session.cancel, ({ params }) => agent.cancel(params));
+}
+
+/** The `state_update` that reports `state` as the current foreground state. */
+function stateSnapshot(state: "idle" | "running" | "requires_action"): v2.SessionUpdate {
+  if (state === "idle") return { sessionUpdate: "state_update", state: "idle" };
+  if (state === "running") return { sessionUpdate: "state_update", state: "running" };
+  return { sessionUpdate: "state_update", state: "requires_action" };
 }
 
 /**
@@ -144,12 +168,27 @@ async function setupCommands(
 class V2ClientConnection implements AcpClient {
   /**
    * The sessions whose history replays, each with the messages that the
-   * replay has cleared so far.
+   * replay has cleared so far. A subagent that a replay announces replays
+   * with it.
    */
   private readonly replays = new Map<string, Set<string>>();
 
+  /** The session whose replay announced each replaying subagent. */
+  private readonly replayRoots = new Map<string, string>();
+
+  /**
+   * The last work state that a replay reported for each subagent, as the
+   * `state_update` of the child's own stream. It goes out once the replay
+   * ends: v2 forbids replaying a child's past `running` and `idle` as current
+   * activity.
+   */
+  private readonly replayedChildStates = new Map<string, v2.UpdateSessionNotification>();
+
   /** The display terminals of the commands that the agent runs. */
   readonly terminals = new V2Terminals();
+
+  /** The `_meta` that the client stores for each tool call. */
+  readonly toolCallMeta = new V2ToolCallMeta();
 
   constructor(
     private readonly ctx: v2.AgentContext,
@@ -163,13 +202,28 @@ class V2ClientConnection implements AcpClient {
    * replayed message, and chunks append, so before the first replayed chunk of
    * each message the client gets the message with no content, which clears it,
    * as v2 requires of a message replayed as chunks.
+   *
+   * Each replayed subagent gets one `state_update` on its own stream, with its
+   * last state, after the replay.
    */
   async replaying<T>(sessionId: string, restore: () => Promise<T>): Promise<T> {
     this.replays.set(sessionId, new Set());
+    const children = () =>
+      [...this.replayRoots].filter(([, root]) => root === sessionId).map(([child]) => child);
     try {
-      return await restore();
+      const result = await restore();
+      for (const child of children()) {
+        const state = this.replayedChildStates.get(child);
+        if (state) void this.send(state);
+      }
+      return result;
     } finally {
       this.replays.delete(sessionId);
+      for (const child of children()) {
+        this.replays.delete(child);
+        this.replayRoots.delete(child);
+        this.replayedChildStates.delete(child);
+      }
     }
   }
 
@@ -196,22 +250,46 @@ class V2ClientConnection implements AcpClient {
   }
 
   async sessionUpdate({ update, ...notification }: AcpSessionNotification): Promise<void> {
+    // A subagent that a replay announces replays too, so its messages are
+    // cleared before their first replayed chunk, as the parent's are.
+    if (
+      update.sessionUpdate === "subagent_update" &&
+      this.replays.has(notification.sessionId) &&
+      !this.replays.has(update.sessionId)
+    ) {
+      this.replays.set(update.sessionId, new Set());
+      this.replayRoots.set(
+        update.sessionId,
+        this.replayRoots.get(notification.sessionId) ?? notification.sessionId,
+      );
+    }
     const updates = this.v2Updates(notification.sessionId, update).flatMap((v2Update) => {
       const clear = this.replayClear(notification.sessionId, v2Update);
       return clear ? [clear, v2Update] : [v2Update];
     });
+    // A subagent's work state also goes to the child's own stream, after the
+    // parent's copy. During a replay, only its last state goes, after the
+    // replay (see `replayedChildStates`).
+    let childState = v2ChildStateUpdate(update);
+    if (childState && this.replays.has(notification.sessionId)) {
+      this.replayedChildStates.set(childState.sessionId, childState);
+      childState = undefined;
+    }
     // Every update goes to the connection before any is awaited, so an update
     // that another call sends meanwhile cannot come between them.
-    await Promise.all(
-      updates.map((v2Update) =>
+    await Promise.all([
+      ...updates.map((v2Update) =>
         this.ctx.notify(v2.methods.client.session.update, { ...notification, update: v2Update }),
       ),
-    );
+      ...(childState ? [this.ctx.notify(v2.methods.client.session.update, childState)] : []),
+    ]);
   }
 
   /**
    * The v2 updates of a v1 update: for a tool call report, the updates of its
-   * terminal first, then the report itself (see {@link V2Terminals}).
+   * terminal first (see {@link V2Terminals}), then the report itself, with the
+   * `_meta` keys that it changes (see {@link V2ToolCallMeta}), and during a
+   * replay the `_meta` of a tool call that the report cleared.
    */
   private v2Updates(
     sessionId: string,
@@ -222,8 +300,23 @@ class V2ClientConnection implements AcpClient {
       return v2Update ? [v2Update] : [];
     }
     const { terminal, report } = this.terminals.split(sessionId, update);
-    const reportUpdate = report && v2SessionUpdate(report);
-    return [...terminal, ...(reportUpdate ? [reportUpdate] : [])];
+    if (!report) return terminal;
+    const starts = report.sessionUpdate === "tool_call";
+    const [reported, metaPatch] = this.toolCallMeta.apply(
+      sessionId,
+      report,
+      starts,
+      this.replays.has(sessionId),
+    );
+    const reportUpdate = v2SessionUpdate(reported);
+    const metaUpdate = metaPatch
+      ? v2SessionUpdate({ sessionUpdate: "tool_call_update", ...metaPatch })
+      : undefined;
+    return [
+      ...terminal,
+      ...(reportUpdate ? [reportUpdate] : []),
+      ...(metaUpdate ? [metaUpdate] : []),
+    ];
   }
 
   /**
@@ -246,9 +339,11 @@ class V2ClientConnection implements AcpClient {
     params: AcpPermissionRequest,
     signal?: AbortSignal,
   ): Promise<RequestPermissionResponse> {
+    // The subject is an update of the tool call, with its stored `_meta`.
+    const toolCall = this.toolCallMeta.subject(params.sessionId, params.toolCall);
     const response = await this.ctx.request(
       v2.methods.client.session.requestPermission,
-      v2PermissionRequest(params),
+      v2PermissionRequest({ ...params, toolCall }),
       { cancellationSignal: signal },
     );
     return v1PermissionResponse(response);
