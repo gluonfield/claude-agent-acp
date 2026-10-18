@@ -81,6 +81,7 @@ const taskNotification = (
   taskId: string,
   toolUseId: string | undefined,
   status: "completed" | "failed" | "stopped",
+  fields: Record<string, unknown> = {},
 ) =>
   system("task_notification", {
     task_id: taskId,
@@ -88,6 +89,7 @@ const taskNotification = (
     status,
     summary: `Task ${status}`,
     output_file: `/tmp/tasks/${taskId}.output`,
+    ...fields,
   });
 
 const taskUpdated = (taskId: string, status: string) =>
@@ -227,29 +229,16 @@ const scenarios: Scenario[] = [
     ],
   },
   {
-    // A workflow starts an agent that no tool call spawned.
-    name: "no-tool-call",
-    turns: [
-      async function* () {
-        yield taskStarted("agent_wf", undefined, inner);
-        yield taskNotification("agent_wf", undefined, "completed");
-        yield* assistantTurn("msg_wf", [{ type: "text", text: "The workflow ran." }]);
-        yield result();
-        yield idle();
-      },
-    ],
-  },
-  {
-    // A reset starts a new conversation whose task ids can repeat the old ones.
+    // A reset starts a new conversation; the old one's agents report no end.
     name: "conversation-reset",
     turns: [
       async function* (ctx) {
         yield* toolCall(
           ctx,
           { id: "toolu_before", name: "Agent", input: { ...background, run_in_background: true } },
-          asyncLaunch("agent_same", background),
+          asyncLaunch("agent_before", background),
         );
-        yield taskStarted("agent_same", "toolu_before", background, { is_backgrounded: true });
+        yield taskStarted("agent_before", "toolu_before", background, { is_backgrounded: true });
         yield {
           type: "conversation_reset",
           new_conversation_id: "22222222-3333-4444-8555-666666666666",
@@ -258,6 +247,8 @@ const scenarios: Scenario[] = [
           session_id: activeSdkSessionId(),
         };
         yield system("background_tasks_changed", { tasks: [] });
+        // A late report of the old conversation's agent changes nothing.
+        yield taskNotification("agent_before", "toolu_before", "completed");
         yield result();
         yield idle();
       },
@@ -265,9 +256,53 @@ const scenarios: Scenario[] = [
         yield* assistantTurn("msg_after", [
           { type: "tool_use", id: "toolu_after", name: "Agent", input: foreground },
         ]);
-        yield taskStarted("agent_same", "toolu_after", foreground);
+        yield taskStarted("agent_after", "toolu_after", foreground);
         yield toolResult("toolu_after", [{ type: "text", text: "Done." }]);
-        yield taskUpdated("agent_same", "completed");
+        yield taskUpdated("agent_after", "completed");
+        yield result();
+        yield idle();
+      },
+    ],
+  },
+  {
+    // The Claude worker restarted and found the agent orphaned.
+    name: "worker-restart",
+    turns: [
+      async function* (ctx) {
+        yield* toolCall(
+          ctx,
+          { id: "toolu_orphan", name: "Agent", input: { ...background, run_in_background: true } },
+          asyncLaunch("agent_orphan", background),
+        );
+        yield taskStarted("agent_orphan", "toolu_orphan", background, { is_backgrounded: true });
+        yield taskNotification("agent_orphan", "toolu_orphan", "stopped", {
+          reason: "worker_restart",
+        });
+        yield result();
+        yield idle();
+      },
+    ],
+  },
+  {
+    // After an adapter restart, SendMessage resumes an agent of an earlier
+    // process: Claude registers it again under the SendMessage call.
+    name: "resumed-after-restart",
+    turns: [
+      async function* (ctx) {
+        yield* toolCall(
+          ctx,
+          { id: "toolu_send", name: "SendMessage", input: { to: "agent_old", message: "Go on" } },
+          { content: "Message sent.", structured: { success: true } },
+        );
+        yield taskStarted(
+          "agent_old",
+          "toolu_send",
+          { ...background, prompt: "Go on" },
+          {
+            is_backgrounded: true,
+          },
+        );
+        yield taskNotification("agent_old", "toolu_send", "completed");
         yield result();
         yield idle();
       },
@@ -409,9 +444,9 @@ const identity = (id: string, input: ReturnType<typeof agentInput>) => ({
 describe("Jaz subagent records", () => {
   it("reports a foreground agent from start to completion", () => {
     expect(subagentRecords("foreground")).toEqual([
-      identity("toolu_fg", foreground),
-      { provider: "claude", id: "toolu_fg", status: "running", summary: "Read" },
-      { provider: "claude", id: "toolu_fg", status: "completed" },
+      identity("agent_fg", foreground),
+      { provider: "claude", id: "agent_fg", status: "running", summary: "Read" },
+      { provider: "claude", id: "agent_fg", status: "completed" },
     ]);
   });
 
@@ -439,42 +474,42 @@ describe("Jaz subagent records", () => {
     expect(launchDone).toBeGreaterThanOrEqual(0);
     expect(completed).toBeGreaterThan(launchDone);
     expect(subagentRecords("background")).toEqual([
-      identity("toolu_bg", background),
-      { provider: "claude", id: "toolu_bg", status: "running", summary: "Read" },
-      { provider: "claude", id: "toolu_bg", status: "completed" },
-      { provider: "claude", id: "toolu_bg", status: "running" },
-      { provider: "claude", id: "toolu_bg", status: "running", summary: "Grep" },
-      { provider: "claude", id: "toolu_bg", status: "completed" },
-      identity("toolu_bg", background),
-      { provider: "claude", id: "toolu_bg", status: "completed" },
+      identity("agent_bg", background),
+      { provider: "claude", id: "agent_bg", status: "running", summary: "Read" },
+      { provider: "claude", id: "agent_bg", status: "completed" },
+      { provider: "claude", id: "agent_bg", status: "running" },
+      { provider: "claude", id: "agent_bg", status: "running", summary: "Grep" },
+      { provider: "claude", id: "agent_bg", status: "completed" },
+      identity("agent_bg", background),
+      { provider: "claude", id: "agent_bg", status: "completed" },
     ]);
   });
 
   it("reports a stopped agent as cancelled", () => {
     expect(subagentRecords("stopped")).toEqual([
-      identity("toolu_stop", background),
-      { provider: "claude", id: "toolu_stop", status: "cancelled" },
+      identity("agent_stop", background),
+      { provider: "claude", id: "agent_stop", status: "cancelled" },
     ]);
     expect(subagentRecords("killed")).toEqual([
-      identity("toolu_kill", foreground),
-      { provider: "claude", id: "toolu_kill", status: "cancelled" },
+      identity("agent_kill", foreground),
+      { provider: "claude", id: "agent_kill", status: "cancelled" },
     ]);
   });
 
   it("reports a failed agent from its terminal patch", () => {
     expect(subagentRecords("failed")).toEqual([
-      identity("toolu_fail", foreground),
-      { provider: "claude", id: "toolu_fail", status: "failed" },
+      identity("agent_fail", foreground),
+      { provider: "claude", id: "agent_fail", status: "failed" },
     ]);
   });
 
   it("names a nested agent itself instead of crediting its parent", () => {
     expect(subagentRecords("nested")).toEqual([
-      identity("toolu_outer", outer),
-      identity("toolu_inner", inner),
-      { provider: "claude", id: "toolu_inner", status: "running", summary: "Read" },
-      { provider: "claude", id: "toolu_inner", status: "completed" },
-      { provider: "claude", id: "toolu_outer", status: "completed" },
+      identity("agent_outer", outer),
+      identity("agent_inner", inner),
+      { provider: "claude", id: "agent_inner", status: "running", summary: "Read" },
+      { provider: "claude", id: "agent_inner", status: "completed" },
+      { provider: "claude", id: "agent_outer", status: "completed" },
     ]);
   });
 
@@ -482,26 +517,33 @@ describe("Jaz subagent records", () => {
     expect(subagentRecords("background-bash")).toEqual([]);
   });
 
-  it("keys an agent without a spawning tool call by its task id", () => {
-    expect(subagentRecords("no-tool-call")).toEqual([
-      identity("agent_wf", inner),
-      { provider: "claude", id: "agent_wf", status: "completed" },
-    ]);
-  });
-
-  it("ends running agents on a conversation reset and keys the next conversation's agents afresh", () => {
+  it("interrupts running agents on a conversation reset and ignores their late reports", () => {
     expect(subagentRecords("conversation-reset")).toEqual([
-      identity("toolu_before", background),
-      { provider: "claude", id: "toolu_before", status: "failed" },
-      identity("toolu_after", foreground),
-      { provider: "claude", id: "toolu_after", status: "completed" },
+      identity("agent_before", background),
+      { provider: "claude", id: "agent_before", status: "interrupted" },
+      identity("agent_after", foreground),
+      { provider: "claude", id: "agent_after", status: "completed" },
     ]);
   });
 
-  it("fails a running agent when the Claude process dies", () => {
+  it("interrupts a running agent when the Claude process dies", () => {
     expect(subagentRecords("process-died")).toEqual([
-      identity("toolu_died", foreground),
-      { provider: "claude", id: "toolu_died", status: "failed" },
+      identity("agent_died", foreground),
+      { provider: "claude", id: "agent_died", status: "interrupted" },
+    ]);
+  });
+
+  it("reports an agent that a worker restart orphaned as interrupted, not cancelled", () => {
+    expect(subagentRecords("worker-restart")).toEqual([
+      identity("agent_orphan", background),
+      { provider: "claude", id: "agent_orphan", status: "interrupted" },
+    ]);
+  });
+
+  it("keeps an agent's record when SendMessage resumes it after an adapter restart", () => {
+    expect(subagentRecords("resumed-after-restart")).toEqual([
+      identity("agent_old", { ...background, prompt: "Go on" }),
+      { provider: "claude", id: "agent_old", status: "completed" },
     ]);
   });
 });

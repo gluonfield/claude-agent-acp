@@ -4531,7 +4531,7 @@ export class ClaudeAcpAgent {
     ));
 
     // A client with native subagent sessions gets the subagent lifecycle from
-    // subagent_spawned and subagent_state_update instead.
+    // its child sessions instead.
     const jazSubagents = subagents.enabled
       ? undefined
       : (session.jazSubagentReporter ??= new JazSubagentReporter(
@@ -4661,7 +4661,7 @@ export class ClaudeAcpAgent {
             ),
           ),
         jazSubagents
-          ?.finishAll(nativeState === "cancelled" ? "cancelled" : "failed")
+          ?.finishAll()
           .catch((error) =>
             this.logger.error(
               `Session ${params.sessionId}: failed to publish terminal Jaz subagent state ${context}`,

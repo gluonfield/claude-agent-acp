@@ -7,9 +7,12 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import { isSubagentTask } from "./async-tasks.js";
 
-type SubagentStatus = "running" | "completed" | "failed" | "cancelled";
+/** `interrupted`: the agent stopped running for a reason Claude Code did not
+ *  report, such as the Claude process exiting or restarting. */
+type SubagentStatus = "running" | "completed" | "failed" | "cancelled" | "interrupted";
 
-/** The Jaz Subtasks record of one Claude subagent, keyed by the id of the Agent tool call that spawned it. */
+/** The Jaz Subtasks record of one Claude subagent, keyed by its agent id (the
+ *  SDK task id), which a resumed agent keeps, also after an adapter restart. */
 export type JazProviderSubagent = {
   provider: "claude";
   id: string;
@@ -21,8 +24,6 @@ export type JazProviderSubagent = {
 };
 
 type TrackedSubagent = {
-  /** The record id: the spawning tool call, or the task id when the SDK names none. */
-  id: string;
   status: SubagentStatus;
   summary?: string;
 };
@@ -34,7 +35,8 @@ type TrackedSubagent = {
  * as a `session_info_update` that carries only `_meta.jaz.providerSubagent`.
  */
 export class JazSubagentReporter {
-  /** Subagent tasks by task id. `task_updated` names only the task. */
+  /** Subagent tasks by task id. `task_updated` names only the task, and only
+   *  `task_started` says that a task is an agent. */
   private readonly tasks = new Map<string, TrackedSubagent>();
 
   constructor(
@@ -46,19 +48,13 @@ export class JazSubagentReporter {
     if (!isSubagentTask(message)) {
       return;
     }
-    // A resumed agent keeps the record of its first run.
-    const previous = this.tasks.get(message.task_id);
-    const task: TrackedSubagent = {
-      id: previous?.id ?? message.tool_use_id ?? message.task_id,
-      status: "running",
-    };
-    this.tasks.set(message.task_id, task);
+    this.tasks.set(message.task_id, { status: "running" });
     const name = nonBlank(message.description);
     const role = nonBlank(message.subagent_type);
     const prompt = nonBlank(message.prompt);
     await this.publish({
       provider: "claude",
-      id: task.id,
+      id: message.task_id,
       status: "running",
       ...(name ? { name } : {}),
       ...(role ? { role } : {}),
@@ -75,15 +71,12 @@ export class JazSubagentReporter {
     if (!summary || summary === task.summary) {
       return;
     }
-    await this.publish({ provider: "claude", id: task.id, status: "running", summary });
+    await this.publish({ provider: "claude", id: message.task_id, status: "running", summary });
     task.summary = summary;
   }
 
   async taskNotification(message: SDKTaskNotificationMessage): Promise<void> {
-    await this.setStatus(
-      message.task_id,
-      message.status === "stopped" ? "cancelled" : message.status,
-    );
+    await this.setStatus(message.task_id, notificationStatus(message));
   }
 
   async taskUpdated(message: SDKTaskUpdatedMessage): Promise<void> {
@@ -94,14 +87,14 @@ export class JazSubagentReporter {
   }
 
   /** Ends every running agent: the Claude stream ended with them. */
-  async finishAll(status: "failed" | "cancelled"): Promise<void> {
+  async finishAll(): Promise<void> {
     const errors: unknown[] = [];
     for (const [taskId, task] of this.tasks) {
       if (task.status !== "running") {
         continue;
       }
       try {
-        await this.setStatus(taskId, status);
+        await this.setStatus(taskId, "interrupted");
       } catch (error) {
         errors.push(error);
       }
@@ -121,7 +114,7 @@ export class JazSubagentReporter {
     if (!task || task.status === status) {
       return;
     }
-    await this.publish({ provider: "claude", id: task.id, status });
+    await this.publish({ provider: "claude", id: taskId, status });
     task.status = status;
   }
 
@@ -131,6 +124,14 @@ export class JazSubagentReporter {
       update: { sessionUpdate: "session_info_update", _meta: { jaz: { providerSubagent } } },
     });
   }
+}
+
+function notificationStatus(message: SDKTaskNotificationMessage): SubagentStatus {
+  if (message.status !== "stopped") {
+    return message.status;
+  }
+  // A worker restart found the task orphaned; nobody stopped it.
+  return message.reason === "worker_restart" ? "interrupted" : "cancelled";
 }
 
 /** The SDK resumes a finished subagent under the same task id with a running patch. */
