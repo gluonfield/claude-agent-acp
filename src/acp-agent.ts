@@ -9681,7 +9681,7 @@ export class ClaudeAcpAgent {
    *  is its result or idle: until then, Claude Code's results for the cycle's
    *  tool calls still reach the client after a cancel. */
   private workEndReported(sessionId: string, session: Session): boolean {
-    return this.foregroundEvents
+    return this.v2
       ? !this.foregroundWork.has(sessionId)
       : !session.activeTurn && !this.runsAutonomousCycle(sessionId);
   }
