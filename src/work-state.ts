@@ -1,4 +1,5 @@
 import type { SessionNotification } from "@agentclientprotocol/sdk";
+import type { Session } from "./acp-agent.js";
 import type { ForegroundEvents } from "./turn-events.js";
 import { v2Foreground } from "./v2/prompt.js";
 
@@ -8,16 +9,27 @@ import { v2Foreground } from "./v2/prompt.js";
  * `session_info_update` that carries only `_meta.jaz.stateUpdate`. v1 has no
  * session state, so without it a client sees a model cycle that Claude Code
  * starts on its own, such as its follow-up after a background command
- * finished, only as output, with nothing to say when the cycle ends.
+ * finished, only as output, with nothing to say when the cycle ends. Each
+ * report names, as `tasks`, the background tasks whose end the work took in
+ * since the session's last report, so a client knows whom the work answers.
  */
 export function jazWorkState(
   sessionId: string,
   send: (notification: SessionNotification) => Promise<void>,
+  session: () => Pick<Session, "tasksTakenIn"> | undefined,
 ): ForegroundEvents {
   return v2Foreground(({ sessionUpdate: _, ...stateUpdate }) => {
+    const current = session();
+    const tasks = current?.tasksTakenIn ?? [];
+    if (current) {
+      current.tasksTakenIn = [];
+    }
     void send({
       sessionId,
-      update: { sessionUpdate: "session_info_update", _meta: { jaz: { stateUpdate } } },
+      update: {
+        sessionUpdate: "session_info_update",
+        _meta: { jaz: { stateUpdate: { ...stateUpdate, tasks } } },
+      },
     });
   });
 }

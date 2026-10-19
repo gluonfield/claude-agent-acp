@@ -484,6 +484,26 @@ function isLateTaskRun(session: Session, taskId: string, runId: string | undefin
   return false;
 }
 
+/** Jaz fork: records the task whose end `message` tells the model of. Claude
+ *  Code echoes each task notification it takes into a model call, and names
+ *  the notification a run of its own began with in the run's result; both
+ *  carry the task run's id as `origin.runId` (see `taskRunIds`). */
+function noteTaskTakenIn(session: Session, message: SDKMessage): void {
+  if (
+    (message.type !== "user" && message.type !== "result") ||
+    !isTaskNotificationRecord(message)
+  ) {
+    return;
+  }
+  const runId = (message as { origin: { runId?: string } }).origin.runId;
+  for (const [task, run] of session.taskRunIds ?? []) {
+    if (run === runId) {
+      (session.tasksTakenIn ??= []).push(task);
+      return;
+    }
+  }
+}
+
 /** The structured replacement for the text of a local command that Claude
  *  Code runs itself, such as `/usage` or `/mcp`. */
 type LocalCommandMarkdown = {
@@ -1353,6 +1373,9 @@ export type Session = {
    *  earlier run is dropped (see `isLateTaskRun`). Run ids are per CLI
    *  process, as is a session. Bounded by `MAX_TASK_RUN_IDS`, oldest first. */
   taskRunIds?: Map<string, string>;
+  /** Jaz fork: the background tasks whose end the session's work took in
+   *  since its last v1 work report (see `noteTaskTakenIn`, `jazWorkState`). */
+  tasksTakenIn?: string[];
   /** Native ACP subagent sessions negotiated through PR #1992. Records are
    *  retained for the parent session lifetime so late child output cannot be
    *  rebound to another task after the SDK prunes its live-task registry. */
@@ -5953,6 +5976,9 @@ export class ClaudeAcpAgent {
         }
 
         this.startAutonomousCycle(params.sessionId, session, message);
+        if (!this.v2) {
+          noteTaskTakenIn(session, message);
+        }
 
         switch (message.type) {
           case "system":
@@ -13390,7 +13416,11 @@ export function v1AgentApp(
       const client = new ClientConnection(connection.client);
       agent = new ClaudeAcpAgent(client, logger, {
         foreground: (sessionId) =>
-          jazWorkState(sessionId, (notification) => client.sessionUpdate(notification)),
+          jazWorkState(
+            sessionId,
+            (notification) => client.sessionUpdate(notification),
+            () => agent.sessions[sessionId],
+          ),
       });
       onAgent(agent);
     })

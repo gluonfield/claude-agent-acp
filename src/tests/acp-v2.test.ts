@@ -5399,17 +5399,48 @@ describe("ACP v2 auth", () => {
 // Jaz fork: a v1 client gets the same reports of the session's work, carried
 // by `session_info_update._meta.jaz.stateUpdate` (see src/work-state.ts).
 describe("ACP v1 work state for Jaz", () => {
-  it("reports a prompt turn and a cycle that Claude Code starts on its own", async () => {
+  it("reports a prompt turn and a cycle that Claude Code starts on its own, naming the tasks each took in", async () => {
     const followup = Promise.withResolvers<void>();
+    const task = (options: Options, subtype: string, id: string, fields = {}) => ({
+      type: "system",
+      subtype,
+      task_id: id,
+      run_id: `run-${id}`,
+      uuid: randomUUID(),
+      session_id: options.sessionId,
+      ...fields,
+    });
     scriptTurns(async function* (options) {
-      yield assistantText(options, "Started the build in the background.");
+      yield task(options, "task_started", "build", { description: "make" });
+      yield task(options, "task_started", "lint", { description: "lint" });
+      yield assistantText(options, "Started the build and lint in the background.");
+      // Lint finishes during the turn, and Claude Code tells the model of it
+      // at its next call.
+      yield task(options, "task_notification", "lint", {
+        status: "completed",
+        output_file: "",
+        summary: "lint passed",
+      });
+      yield {
+        type: "user",
+        message: { role: "user", content: "<task-notification>lint passed</task-notification>" },
+        origin: { kind: "task-notification", runId: "run-lint" },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
       yield result(options);
       yield idleState(options);
       await followup.promise;
       // The build finishes, and Claude Code wakes the model to report it.
+      yield task(options, "task_notification", "build", {
+        status: "completed",
+        output_file: "",
+        summary: "build passed",
+      });
       yield assistantText(options, "The build passed.", "msg_followup");
       yield result(options, {
-        origin: { kind: "task-notification" },
+        origin: { kind: "task-notification", runId: "run-build" },
         usage: {
           input_tokens: 7,
           output_tokens: 4,
@@ -5465,6 +5496,7 @@ describe("ACP v1 work state for Jaz", () => {
       "agent_message_chunk",
       "idle end_turn",
     ]);
+    expect(states.map((state) => state.tasks)).toEqual([[], ["lint"], [], ["build"]]);
     expect(states.at(-1)).toMatchObject({
       state: "idle",
       stopReason: "end_turn",
