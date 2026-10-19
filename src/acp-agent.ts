@@ -62,6 +62,7 @@ import {
   ToolCallContent,
 } from "@agentclientprotocol/sdk";
 import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "./turn-events.js";
+import { jazWorkState } from "./work-state.js";
 import {
   AccountInfo,
   AgentInfo,
@@ -13386,7 +13387,11 @@ export function v1AgentApp(
   let agent!: ClaudeAcpAgent;
   const app = acpAgent({ name: "claude-code-acp" })
     .onConnect((connection) => {
-      agent = new ClaudeAcpAgent(new ClientConnection(connection.client), logger);
+      const client = new ClientConnection(connection.client);
+      agent = new ClaudeAcpAgent(client, logger, {
+        foreground: (sessionId) =>
+          jazWorkState(sessionId, (notification) => client.sessionUpdate(notification)),
+      });
       onAgent(agent);
     })
     .onRequest(methods.agent.initialize, (ctx) => agent.initialize(ctx.params))

@@ -5395,3 +5395,80 @@ describe("ACP v2 auth", () => {
     });
   });
 });
+
+// Jaz fork: a v1 client gets the same reports of the session's work, carried
+// by `session_info_update._meta.jaz.stateUpdate` (see src/work-state.ts).
+describe("ACP v1 work state for Jaz", () => {
+  it("reports a prompt turn and a cycle that Claude Code starts on its own", async () => {
+    const followup = Promise.withResolvers<void>();
+    scriptTurns(async function* (options) {
+      yield assistantText(options, "Started the build in the background.");
+      yield result(options);
+      yield idleState(options);
+      await followup.promise;
+      // The build finishes, and Claude Code wakes the model to report it.
+      yield assistantText(options, "The build passed.", "msg_followup");
+      yield result(options, {
+        origin: { kind: "task-notification" },
+        usage: {
+          input_tokens: 7,
+          output_tokens: 4,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      });
+      yield idleState(options);
+    });
+    const trace: string[] = [];
+    const states: Record<string, unknown>[] = [];
+    await v1
+      .client({ name: "v1-test-client" })
+      .onNotification(
+        "_auth/status_update",
+        (params) => params,
+        () => {},
+      )
+      .onNotification(v1.methods.client.session.update, ({ params }) => {
+        const update = params.update as Record<string, any>;
+        const state = update._meta?.jaz?.stateUpdate;
+        if (update.sessionUpdate === "session_info_update" && state) {
+          states.push(state);
+          trace.push(state.stopReason ? `${state.state} ${state.stopReason}` : state.state);
+        } else if (update.sessionUpdate === "agent_message_chunk") {
+          trace.push("agent_message_chunk");
+        }
+      })
+      .connectWith(connectRouter() as unknown as v1.Stream, async (agent) => {
+        await agent.request(v1.methods.agent.initialize, {
+          protocolVersion: v1.PROTOCOL_VERSION,
+          clientCapabilities: {},
+        });
+        const { sessionId } = await agent.request(v1.methods.agent.session.new, {
+          cwd,
+          mcpServers: [],
+        });
+        const response = await agent.request(v1.methods.agent.session.prompt, {
+          sessionId,
+          prompt: text("hi"),
+        });
+        trace.push(`response ${(response as v1.PromptResponse).stopReason}`);
+        followup.resolve();
+        await vi.waitFor(() => expect(trace).toHaveLength(7));
+      });
+
+    expect(trace).toEqual([
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+      "response end_turn",
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+    expect(states.at(-1)).toMatchObject({
+      state: "idle",
+      stopReason: "end_turn",
+      usage: { inputTokens: 7, outputTokens: 4, totalTokens: 11 },
+    });
+  });
+});

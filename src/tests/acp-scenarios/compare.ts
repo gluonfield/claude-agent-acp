@@ -110,8 +110,8 @@ export function withoutAirOnlyKeys(value: unknown): unknown {
 /**
  * The Jaz fork's intended differences from upstream: the MCP refresh
  * capability and a context window that stays unknown (`size: 0`, no used
- * share) until the provider reports it. The Jaz subagent records are extra
- * updates; see {@link isJazSubagentRecord}.
+ * share) until the provider reports it. The Jaz records are extra
+ * updates; see {@link isJazRecord}.
  */
 function withoutJazForkDifferences(record: Recorded): Recorded {
   const copy = structuredClone(record) as Recorded & { payload: Json };
@@ -127,8 +127,9 @@ function withoutJazForkDifferences(record: Recorded): Recorded {
   return copy;
 }
 
-/** A Jaz subagent record: a `session_info_update` that carries only `_meta.jaz`. */
-function isJazSubagentRecord(record: Recorded): boolean {
+/** A Jaz record, of a subagent or of the session's work: a `session_info_update`
+ *  that carries only `_meta.jaz`. */
+function isJazRecord(record: Recorded): boolean {
   const update = updateOf(record);
   const meta = update?._meta as Json | undefined;
   return (
@@ -143,9 +144,7 @@ function isJazSubagentRecord(record: Recorded): boolean {
 function withoutJazFork(baseline: Recorded[], traffic: Recorded[]) {
   return {
     baseline: baseline.map(withoutJazForkDifferences),
-    traffic: traffic
-      .filter((record) => !isJazSubagentRecord(record))
-      .map(withoutJazForkDifferences),
+    traffic: traffic.filter((record) => !isJazRecord(record)).map(withoutJazForkDifferences),
   };
 }
 
