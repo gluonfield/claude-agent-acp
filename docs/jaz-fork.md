@@ -60,6 +60,17 @@ Upstream's native subagent sessions do not replace it yet:
 Move to the RFD once Jaz routes child sessions, offers a Stop for each subagent, and upstream gives
 the RFD to a client with AIR extensions or Jaz no longer needs them. Then delete `src/subagents.ts`.
 
+## Native parity, 0.93.0-jaz.2
+
+0.93.0-jaz.2 adds only client-bound reports (the v1 work state and the tasks each work took in) to
+0.93.0-jaz.1; it sends Claude Code the same arguments, environment and prompts. Measured on macOS
+arm64 on 2026-10-19 with the subscription OAuth profile, `opus[1m]`, paired against 0.93.0-jaz.1
+on the same machine: both sent 62,081 first-turn input tokens including cache, both reported the
+1,000,000-token window after the first turn, and both read the fixture, recalled it after a resume
+in a fresh process, ran `/compact` and recalled it again. On the wire with Claude Code 2.1.300, two
+background commands finishing together produced one cycle whose idle report named both tasks, and a
+command finishing during a turn was named in that turn's idle report.
+
 ## Native parity, 0.93.0-jaz.1
 
 Validated on macOS arm64 on 2026-10-18 with the subscription OAuth profile Jaz uses. No API key
