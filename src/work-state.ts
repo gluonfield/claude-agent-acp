@@ -1,5 +1,6 @@
 import type { SessionNotification } from "@agentclientprotocol/sdk";
-import type { Session } from "./acp-agent.js";
+import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { isTaskNotificationRecord, type Session } from "./acp-agent.js";
 import type { ForegroundEvents } from "./turn-events.js";
 import { v2Foreground } from "./v2/prompt.js";
 
@@ -32,4 +33,27 @@ export function jazWorkState(
       },
     });
   });
+}
+
+/**
+ * Records the task whose end `message` tells the model of, for the next report
+ * of `jazWorkState`. Claude Code echoes each task notification it takes into
+ * a model call, and names the notification a run of its own began with in the
+ * run's result; both carry the task run's id as `origin.runId`, which
+ * `taskRunIds` maps to its task.
+ */
+export function noteTaskTakenIn(session: Session, message: SDKMessage): void {
+  if (
+    (message.type !== "user" && message.type !== "result") ||
+    !isTaskNotificationRecord(message)
+  ) {
+    return;
+  }
+  const runId = (message as { origin: { runId?: string } }).origin.runId;
+  for (const [task, run] of session.taskRunIds ?? []) {
+    if (run === runId) {
+      (session.tasksTakenIn ??= []).push(task);
+      return;
+    }
+  }
 }

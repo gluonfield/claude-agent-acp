@@ -62,7 +62,7 @@ import {
   ToolCallContent,
 } from "@agentclientprotocol/sdk";
 import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "./turn-events.js";
-import { jazWorkState } from "./work-state.js";
+import { jazWorkState, noteTaskTakenIn } from "./work-state.js";
 import {
   AccountInfo,
   AgentInfo,
@@ -482,26 +482,6 @@ function isLateTaskRun(session: Session, taskId: string, runId: string | undefin
     if (oldest !== undefined) runs.delete(oldest);
   }
   return false;
-}
-
-/** Jaz fork: records the task whose end `message` tells the model of. Claude
- *  Code echoes each task notification it takes into a model call, and names
- *  the notification a run of its own began with in the run's result; both
- *  carry the task run's id as `origin.runId` (see `taskRunIds`). */
-function noteTaskTakenIn(session: Session, message: SDKMessage): void {
-  if (
-    (message.type !== "user" && message.type !== "result") ||
-    !isTaskNotificationRecord(message)
-  ) {
-    return;
-  }
-  const runId = (message as { origin: { runId?: string } }).origin.runId;
-  for (const [task, run] of session.taskRunIds ?? []) {
-    if (run === runId) {
-      (session.tasksTakenIn ??= []).push(task);
-      return;
-    }
-  }
 }
 
 /** The structured replacement for the text of a local command that Claude
@@ -2292,7 +2272,7 @@ function taskNotificationsOf(content: unknown): PersistedTaskNotification[] {
  * example a scheduled routine or a message from another session. Such a
  * delivery stays in the transcript like any other prompt.
  */
-function isTaskNotificationRecord(message: unknown): boolean {
+export function isTaskNotificationRecord(message: unknown): boolean {
   const origin = (message as { origin?: unknown }).origin as
     { kind?: unknown; subkind?: unknown } | null | undefined;
   return origin?.kind === "task-notification" && origin.subkind === undefined;

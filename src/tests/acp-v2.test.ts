@@ -5412,6 +5412,7 @@ describe("ACP v1 work state for Jaz", () => {
     });
     scriptTurns(async function* (options) {
       yield task(options, "task_started", "build", { description: "make" });
+      yield task(options, "task_started", "docs", { description: "docs" });
       yield task(options, "task_started", "lint", { description: "lint" });
       yield assistantText(options, "Started the build and lint in the background.");
       // Lint finishes during the turn, and Claude Code tells the model of it
@@ -5432,13 +5433,25 @@ describe("ACP v1 work state for Jaz", () => {
       yield result(options);
       yield idleState(options);
       await followup.promise;
-      // The build finishes, and Claude Code wakes the model to report it.
-      yield task(options, "task_notification", "build", {
-        status: "completed",
-        output_file: "",
-        summary: "build passed",
-      });
+      // The build and the docs finish together. Claude Code wakes the model in
+      // one cycle, whose result names only the build; it echoes the docs'
+      // notification when it takes it into the cycle's next model call.
+      for (const id of ["build", "docs"]) {
+        yield task(options, "task_notification", id, {
+          status: "completed",
+          output_file: "",
+          summary: `${id} passed`,
+        });
+      }
       yield assistantText(options, "The build passed.", "msg_followup");
+      yield {
+        type: "user",
+        message: { role: "user", content: "<task-notification>docs passed</task-notification>" },
+        origin: { kind: "task-notification", runId: "run-docs" },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
       yield result(options, {
         origin: { kind: "task-notification", runId: "run-build" },
         usage: {
@@ -5496,7 +5509,7 @@ describe("ACP v1 work state for Jaz", () => {
       "agent_message_chunk",
       "idle end_turn",
     ]);
-    expect(states.map((state) => state.tasks)).toEqual([[], ["lint"], [], ["build"]]);
+    expect(states.map((state) => state.tasks)).toEqual([[], ["lint"], [], ["docs", "build"]]);
     expect(states.at(-1)).toMatchObject({
       state: "idle",
       stopReason: "end_turn",

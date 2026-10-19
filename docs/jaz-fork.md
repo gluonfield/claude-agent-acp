@@ -10,7 +10,7 @@ plus the patches below. Keep each one through an upstream merge until upstream c
 | Native Default effort     | `src/session-effort.ts`, `applyConfigOptionValue`                                | The effort selector keeps `default`, so Claude Code resolves effort itself. Upstream recommends `medium` to a `recommendedValue` client and writes it to the SDK.                       |
 | Reported model resolution | `resolveReportedModel` in `src/session-model.ts`                                 | A model that Claude reports maps to the row with that id or resolved model, then to one that differs only by the context suffix. Upstream's preference matching can pick a sibling row. |
 | Jaz Subtasks records      | `src/subagents.ts`                                                               | See below.                                                                                                                                                                              |
-| v1 work state             | `src/work-state.ts`, `v1AgentApp`, `workEndReported`, `noteTaskTakenIn`          | v1 has no session state, so Jaz cannot tell when a model cycle that Claude Code starts on its own begins and ends, or whom it answers. See below.                                       |
+| v1 work state             | `src/work-state.ts`, `v1AgentApp`, `workEndReported`                             | v1 has no session state, so Jaz cannot tell when a model cycle that Claude Code starts on its own begins and ends, or whom it answers. See below.                                       |
 | Standalone releases       | `.github/workflows/release-standalone.yml`, `script/build-standalone-release.sh` | Jaz installs platform archives that bundle Claude Code. The npm, release-please and preview workflows are upstream's and are removed.                                                   |
 
 The scenario baseline comparison drops these wire differences in one call, `withoutJazFork` in
@@ -34,7 +34,8 @@ tells the model a task finished in one of two ways, both carrying the run id of 
 `task_*` events as `origin.runId`: it echoes the notification as a user message when it takes it
 into a model call, and it names the notification that a cycle of its own began with in the
 cycle's result. Tasks that finish together go into one cycle, whose result names only the first;
-the others are echoed. `noteTaskTakenIn` maps each run id to its task through `taskRunIds`.
+the others are echoed. `noteTaskTakenIn` in `src/work-state.ts` maps each run id to its task
+through `taskRunIds`; `acp-agent.ts` keeps only its call, the `tasksTakenIn` field and the wiring.
 
 Upstream reports work state only under ACP v2 and names no tasks; drop the patch once Jaz speaks
 v2 and upstream reports what each cycle took in.
