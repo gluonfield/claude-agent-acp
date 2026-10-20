@@ -6,6 +6,7 @@ out_dir="${2:?output directory required}"
 
 sdk_version="$(node -p "require('./package.json').dependencies['@anthropic-ai/claude-agent-sdk']")"
 mkdir -p "$out_dir"
+out_dir="$(cd "$out_dir" && pwd)"
 
 platforms=(
   "darwin-arm64|bun-darwin-arm64|@anthropic-ai/claude-agent-sdk-darwin-arm64|claude-agent-acp|claude"
@@ -17,7 +18,7 @@ platforms=(
 
 npm run build
 
-tmp="$(mktemp -d)"
+tmp="$(mktemp -d "$out_dir/.build-XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
 for item in "${platforms[@]}"; do
@@ -34,5 +35,15 @@ for item in "${platforms[@]}"; do
   rm -rf "$work/package" "$work/$pack_file"
 
   chmod +x "$work/$adapter_binary" "$work/$sdk_binary"
-  tar -C "$work" -czf "$out_dir/claude-agent-acp-${version}-${platform}.tar.gz" "$adapter_binary" "$sdk_binary"
+  if [[ "$platform" == darwin-* ]]; then
+    codesign --force --sign - "$work/$adapter_binary"
+    codesign --verify --strict --verbose=2 "$work/$adapter_binary" "$work/$sdk_binary"
+    case "$platform:$(uname -m)" in
+      darwin-arm64:arm64|darwin-x64:x86_64)
+        "$work/$adapter_binary" --version
+        "$work/$sdk_binary" --version
+        ;;
+    esac
+  fi
+  COPYFILE_DISABLE=1 tar -C "$work" -czf "$out_dir/claude-agent-acp-${version}-${platform}.tar.gz" "$adapter_binary" "$sdk_binary"
 done

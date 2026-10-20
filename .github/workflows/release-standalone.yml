@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -33,7 +33,7 @@ jobs:
       - name: Write checksums
         run: |
           cd dist/standalone
-          sha256sum *.tar.gz > SHA256SUMS
+          shasum -a 256 *.tar.gz > SHA256SUMS
 
       - name: Publish release
         uses: softprops/action-gh-release@v2

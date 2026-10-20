@@ -1,6 +1,6 @@
 # Releases
 
-Releases are automated by [release-please](https://github.com/googleapis/release-please)
+npm releases are automated by [release-please](https://github.com/googleapis/release-please)
 in [`.github/workflows/publish.yml`](../.github/workflows/publish.yml). Every push
 to `main` re-computes the next version from the conventional commit messages and
 keeps a single release PR open, titled `chore(main): release X.Y.Z` and labelled
@@ -9,8 +9,8 @@ keeps a single release PR open, titled `chore(main): release X.Y.Z` and labelled
 Merging that PR is what releases. It tags `vX.Y.Z`, creates the GitHub release,
 publishes to npm, and dispatches a version update to the agent registry.
 
-There is no manual release button, and versions are never typed in by hand: the
-version is an output of the commit history, not an input.
+For npm releases, the version is computed from commit history. Standalone
+archive releases use the separate workflow described below.
 
 ## Releasing
 
@@ -107,6 +107,13 @@ gh workflow run publish.yml -f ref="v<version>" -f publish_npm=true
 npm versions are immutable. If the package already published and only the
 registry update failed, pass `-f publish_npm=false` so the run skips publishing
 and only re-dispatches the registry update.
+
+## Standalone Archives
+
+The separate [Standalone workflow](../.github/workflows/release-standalone.yml)
+builds on macOS, signs the compiled adapters, verifies both macOS executables,
+and runs the native architecture's version commands before archiving. Archives
+exclude macOS filesystem metadata.
 
 ## Credentials
 
