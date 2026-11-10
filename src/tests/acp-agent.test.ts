@@ -16972,6 +16972,51 @@ describe("assembled assistant text fallback", () => {
     });
   }
 
+  it.each([false, true])(
+    "preserves completed results and reports lost session writes (notices: %s)",
+    async (notices) => {
+      const { agent, updates } = createMockAgentWithCapture();
+      if (notices) await initializeClient(agent, { session: { notices: {} } });
+      const warning: agentSdk.SDKSessionWritesLostMessage = {
+        type: "system",
+        subtype: "session_writes_lost",
+        error_code: "ENOSPC",
+        lost: ["transcript", "global_config"],
+        transcript_session_ids: ["test-session"],
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      injectSession(agent, [result(), warning, idle]);
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "1+2" }],
+      });
+
+      expect(response.stopReason).toBe("end_turn");
+      await vi.waitFor(() => {
+        expect(updates.map(({ update }) => update)).toContainEqual(
+          expect.objectContaining(
+            notices
+              ? {
+                  sessionUpdate: "notice",
+                  severity: "warning",
+                  description: "Claude Code could not save transcript, global_config (ENOSPC).",
+                }
+              : {
+                  sessionUpdate: "agent_message_chunk",
+                  content: {
+                    type: "text",
+                    text: "**Warning:** Claude Code could not save transcript, global_config (ENOSPC).",
+                  },
+                  _meta: { claudeCode: warning },
+                },
+          ),
+        );
+      });
+    },
+  );
+
   it("marks informational notices with metadata", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // A hook-blocked prompt: the SDK surfaces the block reason as an

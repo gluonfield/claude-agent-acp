@@ -6368,6 +6368,19 @@ export class ClaudeAcpAgent {
                 }
                 break;
               }
+              case "session_writes_lost": {
+                const description = `Claude Code could not save ${message.lost.join(", ")} (${message.error_code}).`;
+                await sendUpdate({
+                  sessionId: params.sessionId,
+                  update: noticeOrTranscriptUpdate(
+                    { severity: "warning", title: "Session data was not saved", description },
+                    supportsNotices,
+                    `**Warning:** ${description}`,
+                    { claudeCode: message },
+                  ),
+                });
+                break;
+              }
               case "informational": {
                 // Free-form notice from the SDK (e.g. why a UserPromptSubmit/Stop
                 // hook blocked continuation). Surface the text so the user sees it
