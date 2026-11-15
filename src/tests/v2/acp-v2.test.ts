@@ -4320,7 +4320,7 @@ describe("ACP v2 prompts", () => {
   );
 });
 
-describe("ACP v2 idle compaction", () => {
+describe("ACP v2 provider-owned compaction", () => {
   /** A main-thread request that wrote 250k tokens to the one-hour cache. */
   const largeOneHourRequest = (options: Options) => ({
     ...assistantText(options, "Done."),
@@ -4384,35 +4384,18 @@ describe("ACP v2 idle compaction", () => {
     return { received, client };
   }
 
-  /** The session is idle for 54 minutes after a large one-hour request, and the adapter's `/compact` runs. */
-  it("reports the compaction that the adapter starts as running, then idle, with no user_message", async () => {
+  it("adds no compaction prompt after a large one-hour request becomes idle", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     try {
       const { received, client } = await promptAndIdle();
 
-      expect(received).toEqual(["hi", "/compact"]);
+      expect(received).toEqual(["hi"]);
       expect(turnTrace(client.sessionUpdates)).toEqual([
         "user_message",
         "running",
         "agent_message_chunk",
         "idle end_turn",
-        "running",
-        "idle end_turn",
       ]);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  /** The client's `settings` option reaches the CLI as `--settings`, and idle compaction reads it too. */
-  it("does not compact a session whose client turned idle compaction off in the settings option", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
-    try {
-      const { received } = await promptAndIdle({
-        claudeCode: { options: { settings: { idleCompaction: false } } },
-      });
-
-      expect(received).toEqual(["hi"]);
     } finally {
       vi.useRealTimers();
     }

@@ -4,7 +4,6 @@ import {
   ContextCompactionLifecycle,
   clientSupportsCompactionUpdates,
   compactionSummaryText,
-  contextCompactionMetadataFromBoundary,
   isCompactSummaryMessage,
 } from "../context-compaction.js";
 
@@ -646,21 +645,4 @@ describe("ContextCompactionLifecycle (tool_call)", () => {
       },
     ]);
   });
-});
-
-describe("contextCompactionMetadataFromBoundary", () => {
-  /** An adapter-sent compaction is `idle` only when the CLI calls it manual; the CLI's own auto trigger stays `automatic`. */
-  it.each([
-    { cli: "manual", idleCompaction: false, expected: "manual" },
-    { cli: "manual", idleCompaction: true, expected: "idle" },
-    { cli: "auto", idleCompaction: true, expected: "automatic" },
-  ] as const)(
-    "reports $expected for a $cli boundary (idleCompaction: $idleCompaction)",
-    ({ cli, idleCompaction, expected }) => {
-      expect(
-        contextCompactionMetadataFromBoundary({ trigger: cli, pre_tokens: 1 }, { idleCompaction })
-          .trigger,
-      ).toBe(expected);
-    },
-  );
 });

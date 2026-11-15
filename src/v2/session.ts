@@ -175,8 +175,6 @@ export class V2Session implements RequestTarget {
   readonly output: SessionOutput;
   /** Usage, quota, notices, compactions and the title (see {@link SessionReports}). */
   readonly reports: SessionReports;
-  /** Resolves the adapter's own `/compact` once a turn ends (see {@link compact}). */
-  private ownCommandDone: (() => void) | undefined;
   /** The `background` lists of the session and its children, stamped on each state. */
   private readonly background: V2Background;
   readonly tasks: SessionTasks;
@@ -239,8 +237,6 @@ export class V2Session implements RequestTarget {
       logger: connection.logger,
       airClient: connection.air.client,
       emit: (notifications) => this.output.emitV1(notifications),
-      isBusy: () => this.foreground || this.pending.size > 0 || this.requests.size > 0,
-      compact: () => this.compact(),
       titledSession: () => (this.query && !this.closed ? titled : undefined),
     });
     this.fileChanges = TurnFileChanges.create(connection.air.fileChangeReport, {
@@ -495,37 +491,6 @@ export class V2Session implements RequestTarget {
   }
 
   /**
-   * The adapter's idle compaction: `/compact`, as Claude Code's own turn. It
-   * is no prompt of the client's, so it gets no `user_message`, and the client
-   * sees its turn as `running`, then `idle`. Resolves when a turn ends after
-   * it: the idle compaction runs it only while the session is idle, so the
-   * next turn to end is its own.
-   */
-  private compact(): Promise<void> {
-    return new Promise((resolve) => {
-      this.ownCommandDone?.();
-      this.ownCommandDone = resolve;
-      const message = {
-        ...promptToClaude({
-          sessionId: this.sessionId,
-          prompt: [{ type: "text", text: "/compact" }],
-        }),
-        uuid: randomUUID(),
-      };
-      this.pushes = this.pushes
-        .then(() => this.interrupting)
-        .then(() => {
-          if (this.closed) {
-            resolve();
-            return;
-          }
-          this.remoteControl.pushed(message.uuid);
-          this.input.push(message);
-        });
-    });
-  }
-
-  /**
    * Sends Claude Code the adapter's own prompt `text`, after the interrupt of
    * an earlier `session/cancel`, as {@link prompt} does. It is no prompt of
    * the client's: it gets no `user_message`, also when its echo carries the
@@ -559,7 +524,6 @@ export class V2Session implements RequestTarget {
    */
   async cancel(): Promise<void> {
     if (this.closed || !this.query) return;
-    this.reports.disarmIdleCompaction("cancel");
     this.stopForeground();
     // `cancelQueued` is untyped in the SDK (`Query.interrupt` takes it since
     // the CLI's `interrupt_cancel_queued_v1`): Claude Code then drops the
@@ -665,7 +629,7 @@ export class V2Session implements RequestTarget {
       this.failPending(RequestError.requestCancelled());
       this.closed = true;
       this.checkBoundary();
-      this.endReports();
+      this.reports.dispose();
       this.input.end();
       this.query?.close();
     })();
@@ -820,7 +784,7 @@ export class V2Session implements RequestTarget {
     );
   }
 
-  /** The reports follow the model: its context window, and the idle compaction. */
+  /** The reports follow the model's context window. */
   private modelChangedReports(): void {
     const { id, info } = this.config.currentModel();
     this.reports.modelChanged(id, info);
@@ -841,7 +805,7 @@ export class V2Session implements RequestTarget {
    * Task* ids and task store are independent of the previous transcript. The
    * old conversation's plans are removed (`plan_removed` of the checklist and
    * of the approved ExitPlanMode plan) before a follow-up prompt can
-   * republish stale tasks, and the title and the idle compaction start over.
+   * republish stale tasks, and the title starts over.
    * The fresh context of an approved plan removes no plan: that plan becomes
    * the session's plan in it.
    */
@@ -1255,7 +1219,7 @@ export class V2Session implements RequestTarget {
 
   /** The query ended, with `error` when it failed. The session cannot go on. */
   private ended(error: unknown): void {
-    this.endReports();
+    this.reports.dispose();
     if (this.closing || this.closed) {
       this.tasks.queryEnded(undefined);
       this.failPending(RequestError.requestCancelled());
@@ -1292,13 +1256,6 @@ export class V2Session implements RequestTarget {
     this.closed = true;
     this.checkBoundary();
     this.connection.ended(this);
-  }
-
-  /** The session ends: its idle compaction is off, and its own `/compact` settles. */
-  private endReports(): void {
-    this.reports.dispose();
-    this.ownCommandDone?.();
-    this.ownCommandDone = undefined;
   }
 
   // --- State ---------------------------------------------------------------
@@ -1352,9 +1309,6 @@ export class V2Session implements RequestTarget {
     this.lastEnd = undefined;
     this.turnCommand = undefined;
     this.turnReport.reset();
-    const ownCommandDone = this.ownCommandDone;
-    this.ownCommandDone = undefined;
-    ownCommandDone?.();
     this.turnLocalCommand = undefined;
     this.checkBoundary();
   }

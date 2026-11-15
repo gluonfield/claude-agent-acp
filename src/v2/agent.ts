@@ -823,7 +823,6 @@ class V2Agent implements AgentHandle, SessionConnection {
     } = await this.openQuery(sessionId, params, resume, history);
     session.reports.configure({
       settings: opened.settings,
-      configuredSettings: opened.configured,
       env: opened.env,
       mcpServers: opened.request.mcpServers.map((server) => server.name),
       mcpOAuth: this.elicitation.url && supportsMcpOAuth(q),
@@ -891,8 +890,6 @@ class V2Agent implements AgentHandle, SessionConnection {
       this.logger,
       { allowBypass, allowAuto },
     );
-    // The settings stay live for the idle compaction (see `reports.ts`) until the session
-    // ends. They keep the values they read: their cwd and key helper.
     const authStarted = this.auth.sessionStarting(settings);
     const routeGeneration = this.auth.routeGeneration;
     const routing = this.auth.routing();
@@ -1088,7 +1085,6 @@ class V2Agent implements AgentHandle, SessionConnection {
       config,
       models,
       settings,
-      configured,
       env: options.env ?? {},
       request,
       mcpServers,

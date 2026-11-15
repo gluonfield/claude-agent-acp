@@ -1,7 +1,6 @@
 import { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import {
   ContextCompactionMetadata,
-  ContextCompactionTrigger,
   createContextCompactionMeta,
 } from "./context-compaction-meta.js";
 import { assistantMessageText } from "./session-failure-extension.js";
@@ -440,29 +439,14 @@ function withoutError({
   return facts;
 }
 
-function compactionTrigger(
-  cliTrigger: "manual" | "auto",
-  sentByAdapter: boolean,
-): ContextCompactionTrigger {
-  // The CLI's own automatic compaction stays automatic, even inside the adapter's /compact turn.
-  if (cliTrigger === "auto") return "automatic";
-  // The CLI reports every /compact as manual; only the adapter knows it sent this one itself.
-  if (sentByAdapter) return "idle";
-  return "manual";
-}
-
-/** `idleCompaction` marks a `/compact` that the adapter sent itself (see `IdleCompaction`). */
-export function contextCompactionMetadataFromBoundary(
-  compactMetadata: {
-    trigger: "manual" | "auto";
-    pre_tokens: number;
-    post_tokens?: number;
-    duration_ms?: number;
-  },
-  { idleCompaction = false }: { idleCompaction?: boolean } = {},
-): Omit<ContextCompactionMetadata, "version"> {
+export function contextCompactionMetadataFromBoundary(compactMetadata: {
+  trigger: "manual" | "auto";
+  pre_tokens: number;
+  post_tokens?: number;
+  duration_ms?: number;
+}): Omit<ContextCompactionMetadata, "version"> {
   return {
-    trigger: compactionTrigger(compactMetadata.trigger, idleCompaction),
+    trigger: compactMetadata.trigger === "auto" ? "automatic" : "manual",
     preTokens: compactMetadata.pre_tokens,
     ...(compactMetadata.post_tokens !== undefined
       ? { postTokens: compactMetadata.post_tokens }
