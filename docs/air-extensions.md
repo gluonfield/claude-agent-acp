@@ -1405,7 +1405,7 @@ ACP's `session/set_title` renames the same way for every client, on v1 and v2, w
 - The title is stored as the title records of [Archive](#archive): a `custom-title` and an `agent-name` record. An archived session keeps its `[archived] ` prefix (and the title is cut to 200 characters with it), so a rename does not unarchive it.
 - A session that runs here on a CLI without the `rename_session` control request is refused with `-32600`: its CLI holds the title and would write it back.
 - A session this connection runs is renamed through its CLI (`rename_session` control request), which writes the records and the sidecar of its own transcript.
-  A title generation in flight finishes first, and no generated title replaces the new one, also after a reload.
+  The adapter reads titles from native session metadata and makes no title-generation model requests.
   The adapter then sends `session_info_update { title }` with the title as stored, without the archive prefix.
   Copies of the session in other project directories get the records and sidecar from the adapter.
 - Any other session gets the records in every transcript of the session and the CLI's `custom-title.json` sidecar next to each (mode 0600, written atomically).
@@ -1438,7 +1438,7 @@ The archive state lives in the session title, in the format of AIR's own Claude 
 
 - Archive of a session loaded on this connection stops it, as Codex's `thread/archive` unloads its thread:
   1. it cancels the running turn, as `session/cancel` does, and sends the CLI the interrupt;
-  2. it retitles the session through its CLI (`rename_session`), as for [Rename](#rename): the CLI keeps the title in memory and writes it again, so only its own write cannot be overtaken. A title generation in flight finishes first, and no generated title replaces the archived one. The CLI writes the custom title before it answers and the agent name only later, so when the CLI's transcript has another agent name, the adapter appends the `agent-name` record of the new title to it at once. Its copies in other project directories get the records from the adapter as a best effort;
+  2. it retitles the session through its CLI (`rename_session`), as for [Rename](#rename): the CLI keeps the title in memory and writes it again, so only its own write cannot be overtaken. The CLI writes the custom title before it answers and the agent name only later, so when the CLI's transcript has another agent name, the adapter appends the `agent-name` record of the new title to it at once. Its copies in other project directories get the records from the adapter as a best effort;
   3. it closes the session as `session/close` does: the cancelled prompt ends with `cancelled`, and the session is no longer loaded. A later `session/prompt` fails as for a closed session; to work in it again, the client unarchives it and loads it.
   4. it archives each transcript that the closed CLI left unarchived once more, with the title records.
 

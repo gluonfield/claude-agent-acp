@@ -2524,11 +2524,8 @@ export class ClaudeAcpAgent {
     const localCommand = this.localCommandMarkdown(params);
     const localCommandAbort = localCommand ? new AbortController() : undefined;
 
-    // An idle compaction is not something the user sent: it must not title the
-    // session `/compact` or spend the prediction the user is still looking at.
+    // Idle compaction must not spend the prediction the user is still looking at.
     if (origin === "client") {
-      session.titles.onPrompt(params.prompt);
-
       // The prompt the previous turn predicted is spent: the user either sent it
       // or sent something else. Clearing it here keeps a turn that predicts
       // nothing (the CLI predicts none in plan mode, after an API error, or at
@@ -2594,7 +2591,6 @@ export class ClaudeAcpAgent {
     (session.sentUserUuids ??= new Set()).add(promptUuid);
     session.input.push(userMessage);
     this.ensureConsumer(session, params.sessionId);
-    if (origin === "client") session.titles.onPromptQueued(session, params.prompt);
     // The prompt is queued, so its turn goes ahead even if the client misses
     // the goal it sets; the turn's events report the outcome.
     await this.publishGoalFromPrompt(params.sessionId, firstText, promptUuid).catch((error) =>
@@ -3322,7 +3318,6 @@ export class ClaudeAcpAgent {
         }
         if (!claudeMeta?.parentToolUseId) {
           session.emittedAssistantText = true;
-          session.titles.onAssistantText(update.content);
         }
       }
       await this.client.sessionUpdate(routedNotification);

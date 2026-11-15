@@ -463,27 +463,6 @@ describe("idle compaction in the agent", () => {
     await agent.dispose();
   });
 
-  /** The idle `/compact` is not a user prompt, so it asks for no title; a client prompt in the same session does. */
-  it("does not feed the idle compaction's prompt to the title machinery", async () => {
-    const claude = scriptClaudeCode();
-    const { agent, sessionId } = await connect();
-    const titles = agent.sessions[sessionId].titles;
-    const onPrompt = vi.spyOn(titles, "onPrompt");
-    const onPromptQueued = vi.spyOn(titles, "onPromptQueued");
-
-    await promptHi(agent, sessionId);
-    await claude.untilIdle();
-    expect(onPrompt).toHaveBeenCalledTimes(1);
-    expect(onPromptQueued).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(54 * MINUTE_MS);
-    await claude.untilIdle();
-
-    expect(claude.received).toEqual(["hi", "/compact"]);
-    expect(onPrompt).toHaveBeenCalledTimes(1);
-    expect(onPromptQueued).toHaveBeenCalledTimes(1);
-    await agent.dispose();
-  });
-
   /** A rate limit warning that arrives mid-turn, before the turn's first request, still skips the compaction at the deadline. */
   it("does not compact after a rate limit warning", async () => {
     const claude = scriptClaudeCode({

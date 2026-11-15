@@ -12,7 +12,6 @@ import type {
   ToolCallContent,
 } from "@agentclientprotocol/sdk/unstable";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
-import type { ContentBlock } from "@agentclientprotocol/sdk/unstable";
 import type {
   SDKAssistantMessage,
   SDKMemoryRecallMessage,
@@ -611,9 +610,6 @@ export class SessionOutput {
   /** The tool calls that the client holds without a final status. */
   private readonly unfinished = new Set<string>();
 
-  /** Called with each live agent text chunk, for the session's title. */
-  onAgentText: ((content: ContentBlock) => void) | undefined;
-
   private emit(notifications: AcpSessionNotification[]): void {
     // A replay routes only what its hooks ask: the live routing tracks live calls.
     const route = this.replayCleared !== undefined ? this.replayHooks?.route : this.route;
@@ -630,7 +626,6 @@ export class SessionOutput {
     const replaying = this.replayCleared !== undefined;
     if (update.sessionUpdate === "agent_message_chunk") {
       this.agentText = true;
-      if (!replaying) this.onAgentText?.(update.content);
     }
     for (const v2Update of this.translator.updates(this.sessionId, update, replaying)) {
       const clear = this.replayCleared && replayClear(this.replayCleared, v2Update);

@@ -232,9 +232,6 @@ export class V2Session implements RequestTarget {
       get queryClosed() {
         return session.closed;
       },
-      get cancelled() {
-        return session.cancelledWork;
-      },
       cwd,
     };
     this.reports = new SessionReports({
@@ -246,7 +243,6 @@ export class V2Session implements RequestTarget {
       compact: () => this.compact(),
       titledSession: () => (this.query && !this.closed ? titled : undefined),
     });
-    this.output.onAgentText = (content) => this.reports.agentText(content);
     this.fileChanges = TurnFileChanges.create(connection.air.fileChangeReport, {
       cwd,
       additionalDirectories: [...workspaceDirectories],
@@ -413,7 +409,7 @@ export class V2Session implements RequestTarget {
     const guarded = guard && !remoteControl ? guard : undefined;
     // A prompt that the guard refuses titles nothing and sends no notice.
     const sent = () => {
-      this.reports.promptSent(request.prompt);
+      this.reports.promptSent();
       // The notice of a mode fallback at the session's start, which sends it at once.
       void this.config.promptSent();
     };
@@ -460,7 +456,6 @@ export class V2Session implements RequestTarget {
           pending.pushed = true;
           this.remoteControl.pushed(uuid);
           this.input.push(message);
-          this.reports.promptQueued(request.prompt);
         });
     });
   }

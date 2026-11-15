@@ -75,8 +75,6 @@ export async function retitleSession(
   options: Pick<RetitleOptions, "mayBeUnwritten" | "sidecar">,
 ): Promise<string | undefined> {
   let stored: string | undefined;
-  // Decided once a title generation in flight has ended: the query may
-  // have closed meanwhile.
   const persist = async () => {
     const session = loaded?.session;
     const query = session?.query as RenamingQuery | undefined;

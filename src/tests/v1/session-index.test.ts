@@ -1307,47 +1307,6 @@ describe("_session/rename", () => {
       update: { sessionUpdate: "session_info_update", title: "Live title" },
     });
   });
-
-  it("waits for a title generation in flight, and the generated title never wins", async () => {
-    const order: string[] = [];
-    let finishGeneration!: (title: string) => void;
-    const updates: any[] = [];
-    const agent: any = {
-      client: { sessionUpdate: async (update: unknown) => updates.push(update) },
-      logger: { error: () => {} },
-      sessions: {},
-    };
-    const titles = new SessionTitles(agent, "s1");
-    const session: any = {
-      queryClosed: false,
-      cancelled: false,
-      cwd: "/nowhere",
-      query: {
-        generateSessionTitle: () =>
-          new Promise<string>((resolve) => {
-            finishGeneration = (title) => {
-              order.push("generated");
-              resolve(title);
-            };
-          }),
-      },
-    };
-    agent.sessions.s1 = session;
-    titles.onPrompt([{ type: "text", text: "Please refactor the parser" }]);
-    vi.mocked(getSessionInfo).mockResolvedValueOnce(undefined);
-    await titles.onTurnEnd(session);
-
-    const renamed = titles.setExplicitTitle("Mine", async () => {
-      order.push("renamed");
-    });
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(order).toEqual([]);
-    finishGeneration("Generated");
-    await renamed;
-    expect(order).toEqual(["generated", "renamed"]);
-    const titlesSent = updates.map((update) => update.update.title);
-    expect(titlesSent).toEqual(["Mine"]);
-  });
 });
 
 describe("session/set_title", () => {
@@ -3163,7 +3122,7 @@ describe("the stored title of an archived session at turn end", () => {
 });
 
 describe("a failed rename", () => {
-  it("leaves the title open to generation", async () => {
+  it("still adopts the native title", async () => {
     const updates: any[] = [];
     const agent: any = {
       client: { sessionUpdate: async (update: unknown) => updates.push(update) },
@@ -3175,18 +3134,19 @@ describe("a failed rename", () => {
       queryClosed: false,
       cancelled: false,
       cwd: "/nowhere",
-      query: { generateSessionTitle: async () => "Generated" },
+      query: {},
     };
     agent.sessions.s1 = session;
-    titles.onPrompt([{ type: "text", text: "Please refactor the parser module" }]);
     await expect(
       titles.setExplicitTitle("Mine", async () => {
         throw new Error("disk full");
       }),
     ).rejects.toThrow("disk full");
-    vi.mocked(getSessionInfo).mockResolvedValueOnce(undefined);
+    vi.mocked(getSessionInfo).mockResolvedValueOnce({
+      customTitle: "Generated",
+      lastModified: 0,
+    } as any);
     await titles.onTurnEnd(session);
-    await new Promise((resolve) => setTimeout(resolve, 10));
     expect(updates.map((update) => update.update.title)).toEqual(["Generated"]);
   });
 });
@@ -4612,7 +4572,7 @@ describe("archive in AIR's title format, edge cases", () => {
 });
 
 describe("an archive that stores nothing", () => {
-  it("leaves the title open to generation", async () => {
+  it("still adopts the native title", async () => {
     const updates: any[] = [];
     const agent: any = {
       client: { sessionUpdate: async (update: unknown) => updates.push(update) },
@@ -4624,14 +4584,15 @@ describe("an archive that stores nothing", () => {
       queryClosed: false,
       cancelled: false,
       cwd: "/nowhere",
-      query: { generateSessionTitle: async () => "Generated" },
+      query: {},
     };
     agent.sessions.s1 = session;
-    titles.onPrompt([{ type: "text", text: "Please refactor the parser module" }]);
     await titles.setExplicitTitle(undefined, async () => undefined);
-    vi.mocked(getSessionInfo).mockResolvedValueOnce(undefined);
+    vi.mocked(getSessionInfo).mockResolvedValueOnce({
+      customTitle: "Generated",
+      lastModified: 0,
+    } as any);
     await titles.onTurnEnd(session);
-    await new Promise((resolve) => setTimeout(resolve, 10));
     expect(updates.map((update) => update.update.title)).toEqual(["Generated"]);
   });
 });
@@ -4706,7 +4667,7 @@ describe("archive in AIR's title format, round two", () => {
     expect(rename.mock.calls).toEqual([["Done", session.id]]);
   });
 
-  it("keeps the title open to generation across overlapping changes that store nothing", async () => {
+  it("still adopts the native title after overlapping changes that store nothing", async () => {
     const updates: any[] = [];
     const agent: any = {
       client: { sessionUpdate: async (update: unknown) => updates.push(update) },
@@ -4718,10 +4679,9 @@ describe("archive in AIR's title format, round two", () => {
       queryClosed: false,
       cancelled: false,
       cwd: "/nowhere",
-      query: { generateSessionTitle: async () => "Generated" },
+      query: {},
     };
     agent.sessions.s1 = session;
-    titles.onPrompt([{ type: "text", text: "Please refactor the parser module" }]);
     let release!: () => void;
     const first = titles.setExplicitTitle(
       undefined,
@@ -4731,9 +4691,11 @@ describe("archive in AIR's title format, round two", () => {
     await new Promise((resolve) => setTimeout(resolve, 5));
     release();
     await Promise.all([first, second]);
-    vi.mocked(getSessionInfo).mockResolvedValueOnce(undefined);
+    vi.mocked(getSessionInfo).mockResolvedValueOnce({
+      customTitle: "Generated",
+      lastModified: 0,
+    } as any);
     await titles.onTurnEnd(session);
-    await new Promise((resolve) => setTimeout(resolve, 10));
     expect(updates.map((update) => update.update.title)).toEqual(["Generated"]);
   });
 });
