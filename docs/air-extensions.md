@@ -934,22 +934,13 @@ This label change applies to every client.
 
 ### Effort
 
-When the current model supports effort, the adapter removes the `default` effort row and recommends `medium`.
-An explicit or settings effort stays the `currentValue`.
-An absent or `default` current effort shows as `medium`.
+The SDK reports supported effort levels, but no recommended default.
+The selector retains `default` so Claude can resolve automatic effort and per-model settings.
+Explicit ACP or SDK effort choices remain pinned while the selected model supports them.
+Switching to an unsupported model clears that explicit override.
 
-The adapter applies the shown effort to the SDK at session creation and at a model switch.
-The selection then matches the effort that Claude uses.
-An explicit SDK `options.effort` and a picker choice stay pinned across model switches while the new model supports them.
-Otherwise each switch reads the settings of the new model again and then falls back to the recommendation.
-A switch to a model without effort support clears the override.
-A client without the capability still lets the SDK choose the effort.
-
-If the effort sync fails after the model switched, the adapter reports the new model.
-It never shows the unapplied effort as current.
-It keeps the last applied value when the new model offers it.
-Otherwise it omits the effort selector until a later switch succeeds.
-If a model offers no `medium` effort, the adapter uses the first effort that the SDK offers.
+Enabling this presentation capability does not write effort settings or change Claude's native defaults.
+The effort selector omits `recommendedValue`.
 
 ### SDK upgrade check
 

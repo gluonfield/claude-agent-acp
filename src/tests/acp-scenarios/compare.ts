@@ -124,6 +124,47 @@ export function withoutAirOnlyKeys(value: unknown): unknown {
   return result;
 }
 
+/**
+ * The Jaz fork's intended differences from upstream: the MCP refresh
+ * capability and a context window that stays unknown (`size: 0`, no used
+ * share) until the provider reports it. The Jaz records are extra
+ * updates; see {@link isJazRecord}.
+ */
+function withoutJazForkDifferences(record: Recorded): Recorded {
+  const copy = structuredClone(record) as Recorded & { payload: Json };
+  const capabilities = (copy.payload.agentCapabilities as Json | undefined)?._meta as
+    Json | undefined;
+  delete capabilities?.mcpRefresh;
+  const update = updateOf(copy);
+  if (update?.sessionUpdate === "usage_update") delete update.size;
+  // An unknown window has no used share for the clear-context option label.
+  for (const option of (copy.payload.options as Json[] | undefined) ?? []) {
+    option.name = (option.name as string).replace(/ \(\d+% used\)/, "");
+  }
+  return copy;
+}
+
+/** A Jaz record, of a subagent or of the session's work: a `session_info_update`
+ *  that carries only `_meta.jaz`. */
+function isJazRecord(record: Recorded): boolean {
+  const update = updateOf(record);
+  const meta = update?._meta as Json | undefined;
+  return (
+    update?.sessionUpdate === "session_info_update" &&
+    Object.keys(update).length === 2 &&
+    meta !== undefined &&
+    Object.keys(meta).join() === "jaz"
+  );
+}
+
+/** Both sides without the Jaz fork's intended differences. */
+function withoutJazFork(baseline: Recorded[], traffic: Recorded[]) {
+  return {
+    baseline: baseline.map(withoutJazForkDifferences),
+    traffic: traffic.filter((record) => !isJazRecord(record)).map(withoutJazForkDifferences),
+  };
+}
+
 /** The replaced fields and the merged `_meta` keys of a tool call report, as JSON. */
 function flatten(update: Json): Map<string, string> {
   const flat = new Map<string, string>();
@@ -271,6 +312,7 @@ function withoutAuthStatusCapability(record: Recorded): Recorded {
  * the compatibility rule does not allow. An empty list means compatible.
  */
 export function compareWithBaseline(baseline: Recorded[], traffic: Recorded[]): string[] {
+  ({ baseline, traffic } = withoutJazFork(baseline, traffic));
   const expected = baseline
     .map((record) =>
       withoutSessionCapabilities(withoutAirOnlyKeys(record) as Recorded, ["subagents"]),

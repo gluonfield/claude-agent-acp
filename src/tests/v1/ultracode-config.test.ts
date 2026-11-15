@@ -259,8 +259,7 @@ describe("ultracode session config option", () => {
     expect(applyFlagSettings).toHaveBeenLastCalledWith({ effortLevel: "low", ultracode: true });
   });
 
-  it("keeps ultracode on through the effort apply that follows a model switch", async () => {
-    // recommendedValue clients apply the new model's effort on every switch.
+  it("keeps ultracode on without pinning effort after a model switch", async () => {
     const { agent, sessionId, applyFlagSettings } = await createSession({
       clientCapabilities: {
         session: { configOptions: { boolean: {} } },
@@ -275,7 +274,7 @@ describe("ultracode session config option", () => {
     });
 
     await agent.setSessionConfigOption({ sessionId, configId: "model", value: "fable" });
-    expect(applyFlagSettings).toHaveBeenLastCalledWith({ effortLevel: "medium", ultracode: true });
+    expect(applyFlagSettings).toHaveBeenLastCalledWith({ ultracode: true });
   });
 
   it("does not change session state when the SDK rejects the flag", async () => {

@@ -252,6 +252,13 @@ describe("matchResumedModel", () => {
     expect(matchResumedModel(LIVE_SHAPED_MODELS, "claude-haiku-4-5-20251001").value).toBe("haiku");
   });
 
+  it("keeps a provider-reported variant distinct from a similar picker name", () => {
+    const result = matchResumedModel(LIVE_SHAPED_MODELS, "claude-opus-4-8-preview");
+    expect(result.value).toBe("claude-opus-4-8-preview");
+    expect(result.resolvedModel).toBeUndefined();
+    expect(result.supportsEffort).toBeUndefined();
+  });
+
   it("tracks a live model with no picker counterpart verbatim", () => {
     const result = matchResumedModel(LIVE_SHAPED_MODELS, "claude-gpt-99");
     expect(result.value).toBe("claude-gpt-99");

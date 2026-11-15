@@ -73,3 +73,17 @@ export function taskNotificationsOf(content: unknown): PersistedTaskNotification
   }
   return notifications;
 }
+
+/**
+ * True for a user record that the CLI wrote to tell the model that a
+ * background task stopped. A `subkind` marks the delivery of a prompt, for
+ * example a scheduled routine or a message from another session. Such a
+ * delivery stays in the transcript like any other prompt.
+ */
+export function isTaskNotificationRecord(
+  message: unknown,
+): message is { origin: { kind: "task-notification"; subkind?: undefined } } {
+  const origin = (message as { origin?: unknown } | null)?.origin as
+    { kind?: unknown; subkind?: unknown } | null | undefined;
+  return origin?.kind === "task-notification" && origin.subkind === undefined;
+}

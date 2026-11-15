@@ -1,4 +1,11 @@
 import {
+  MCP_REFRESH_METHOD,
+  parseMcpRefreshRequest,
+  type McpRefreshRequest,
+} from "../mcp-refresh.js";
+import { JazSubagentReporter } from "../subagents.js";
+import { autonomousCycleEnd, jazWorkState, noteTaskTakenIn, type WorkEnd } from "./work-state.js";
+import {
   agent as acpAgent,
   AgentApp,
   AuthenticateRequest,
@@ -347,7 +354,11 @@ import {
   observeExitPlanToolResults,
 } from "../exit-plan.js";
 import { AGENT_CONFIG_ID, DEFAULT_AGENT_ID } from "../session-config-ids.js";
-import { type PersistedTaskNotification, taskNotificationsOf } from "../task-notifications.js";
+import {
+  isTaskNotificationRecord,
+  type PersistedTaskNotification,
+  taskNotificationsOf,
+} from "../task-notifications.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "../usage-markdown.js";
 
 import { parseMcpCommand, runMcpCommand } from "../mcp-command.js";
@@ -365,7 +376,7 @@ import {
   modelDisplayName,
   modelEntryFor,
   narrowToGatewayModels,
-  resolveModelPreference,
+  resolveReportedModel,
   type SessionModelState,
   withCurrentModelInfo,
 } from "../session-model.js";
@@ -420,7 +431,6 @@ import {
   clearContextWindowCache,
   immediateContextWindow,
   providerCacheKeyFor,
-  readContextWindow,
 } from "../context-window.js";
 import { isLoginRequiredText, resultEnd, turnErrorData } from "../result-end.js";
 import { STARTUP_FAILURE_RESULTS_ENV, startupFailureError } from "../startup-failure.js";
@@ -1095,23 +1105,9 @@ export type Session = {
    *  Parallel subagents can ask concurrently. Steering stays non-interrupting
    *  while any request is open, and the idle compaction waits until none is. */
   openUserInputs?: Set<OpenUserInput>;
-  /** Context window size of the session's current model, carried across
-   *  prompts so mid-stream usage_update notifications report a correct `size`
-   *  before the turn's first result message arrives. Seeded synchronously at
-   *  session creation and on model switches from the per-model cache
-   *  (DEFAULT_CONTEXT_WINDOW on a miss), refined by a background
-   *  `getContextUsage` when that seed was the default (see
-   *  `refreshContextWindowInBackground`), then confirmed — and the cache
-   *  populated — by each result's modelUsage. No awaited IPC is on these
-   *  paths (see the seeding call sites and `contextWindowCache`). */
+  /** SDK-reported context window; zero until the provider supplies it. */
   contextWindowSize: number;
   contextUsedTokens?: number;
-  /** Whether `contextWindowSize` came from an authoritative source (the
-   *  cross-session cache, a `result.modelUsage`, or the background
-   *  `getContextUsage`) rather than the default. The background read runs only
-   *  while it is false: the flag, not the value, tells, because an
-   *  authoritative window can equal DEFAULT_CONTEXT_WINDOW. */
-  contextWindowAuthoritative: boolean;
   /** Stable identifier of the LLM backend this session's query was created
    *  against, derived from the routing-relevant vars of the exact `env` handed
    *  to the SDK at query creation (see {@link providerCacheKeyFor}). The context
@@ -1293,6 +1289,9 @@ export type Session = {
    *  earlier run is dropped (see `isLateTaskRun`). Run ids are per CLI
    *  process, as is a session. Bounded by `MAX_TASK_RUN_IDS`, oldest first. */
   taskRunIds?: Map<string, string>;
+  /** Jaz fork: the background tasks whose end the session's work took in
+   *  since its last v1 work report (see `noteTaskTakenIn`, `jazWorkState`). */
+  tasksTakenIn?: string[];
   /** Native ACP subagent sessions negotiated through PR #1992. Records are
    *  retained for the parent session lifetime so late child output cannot be
    *  rebound to another task after the SDK prunes its live-task registry. */
@@ -1316,6 +1315,8 @@ export type Session = {
   /** Session-owned async task controller. Prompt cancellation intentionally
    *  does not finish it because background work may outlive a prompt. */
   asyncTaskRuntime?: AsyncTaskRuntime;
+  /** Session-owned Jaz Subtasks reporter; background subagents outlive a prompt. */
+  jazSubagentReporter?: JazSubagentReporter;
   /** The consumer's compaction lifecycle, exposed so the PostCompact hook can
    *  hand it the retained summary. */
   contextCompaction?: ContextCompactionLifecycle;
@@ -1514,18 +1515,6 @@ function stripSubagentTextAndThinking(content: unknown): unknown {
  *  revivable, so the only recovery is a fresh session. */
 const SESSION_ENDED_MESSAGE = "The Claude Agent session has ended. Please start a new session.";
 
-/**
- * True for a user record that the CLI wrote to tell the model that a
- * background task stopped. A `subkind` marks the delivery of a prompt, for
- * example a scheduled routine or a message from another session. Such a
- * delivery stays in the transcript like any other prompt.
- */
-function isTaskNotificationRecord(message: unknown): boolean {
-  const origin = (message as { origin?: unknown }).origin as
-    { kind?: unknown; subkind?: unknown } | null | undefined;
-  return origin?.kind === "task-notification" && origin.subkind === undefined;
-}
-
 /** The session failure of an error result at one of Claude Code's limits. */
 const LIMIT_FAILURE_CATEGORY = {
   error_max_budget_usd: "budget_exhausted",
@@ -1672,7 +1661,11 @@ export class ClaudeAcpAgent {
    * moves the running turn to it, so the work belongs to the id, not to a
    * {@link Session}.
    */
-  private readonly foregroundWork = new Map<string, ForegroundOwner>();
+  private readonly foregroundWork = new Map<
+    string,
+    { owner: ForegroundOwner; events?: ReturnType<typeof jazWorkState>; awaitingUser: boolean }
+  >();
+  private readonly foregroundEvents?: (sessionId: string) => ReturnType<typeof jazWorkState>;
   /** The session index (docs/air-extensions.md, "Session index"). */
   private readonly sessionIndex = new sessionIndex.SessionIndexConnection({
     agent: this,
@@ -1694,7 +1687,12 @@ export class ClaudeAcpAgent {
     );
   }
 
-  constructor(client: AcpClient, logger?: Logger) {
+  constructor(
+    client: AcpClient,
+    logger?: Logger,
+    options: { foreground?: (sessionId: string) => ReturnType<typeof jazWorkState> } = {},
+  ) {
+    this.foregroundEvents = options.foreground;
     this.sessions = {};
     this.client = new ChangedMetaClient(client, () => this.toolCallCapabilities.air.client);
     this.logger = logger ?? console;
@@ -1751,6 +1749,17 @@ export class ClaudeAcpAgent {
       supportsNotices: () => clientSupportsNotices(this.clientCapabilities),
       logError: (...args: unknown[]) => this.logger.error(...args),
     });
+  }
+
+  async refreshMcpServers(params: McpRefreshRequest): Promise<Record<string, never>> {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
+      throw RequestError.invalidParams(undefined, `Unknown session: ${params.sessionId}`);
+    }
+    for (const name of params.serverNames) {
+      await session.query.reconnectMcpServer(name);
+    }
+    return {};
   }
 
   async initialize(request: InitializeRequest): Promise<InitializeResponse> {
@@ -1819,6 +1828,7 @@ export class ClaudeAcpAgent {
       protocolVersion: 1,
       agentCapabilities: {
         _meta: {
+          mcpRefresh: { method: MCP_REFRESH_METHOD },
           claudeCode: {
             promptQueueing: true,
           },
@@ -2568,12 +2578,12 @@ export class ClaudeAcpAgent {
         completeTurn = resolve;
       }),
       resolve: (outcome) => {
-        this.endForeground(params.sessionId, turn);
+        this.endForeground(params.sessionId, turn, { outcome });
         events.ended(outcome);
         completeTurn();
       },
       reject: (error) => {
-        this.endForeground(params.sessionId, turn);
+        this.endForeground(params.sessionId, turn, { error });
         events.failed(error);
         completeTurn();
       },
@@ -3222,6 +3232,17 @@ export class ClaudeAcpAgent {
       },
     ));
 
+    // A client with native subagent sessions gets the subagent lifecycle from
+    // its child sessions instead.
+    const jazSubagents = subagents.enabled
+      ? undefined
+      : (session.jazSubagentReporter ??= new JazSubagentReporter(
+          params.sessionId,
+          async (notification) => this.client.sessionUpdate(notification),
+          (toolCallId) =>
+            session.toolUseCache[toolCallId]?.name ?? session.resolvedToolNames?.get(toolCallId),
+        ));
+
     const compaction = new ContextCompactionLifecycle((notification) => sendUpdate(notification), {
       sessionId: params.sessionId,
       airClient: this.toolCallCapabilities.air.client,
@@ -3342,6 +3363,14 @@ export class ClaudeAcpAgent {
           .catch((error) =>
             this.logger.error(
               `Session ${params.sessionId}: failed to publish terminal async task state ${context}`,
+              error,
+            ),
+          ),
+        jazSubagents
+          ?.finishAll()
+          .catch((error) =>
+            this.logger.error(
+              `Session ${params.sessionId}: failed to publish terminal Jaz subagent state ${context}`,
               error,
             ),
           ),
@@ -3815,6 +3844,7 @@ export class ClaudeAcpAgent {
       if (isSubagent && session.activeTurn && !session.activeTurn.settled) {
         (session.activeTurn.spawnedTaskIds ??= new Set()).add(taskId);
       }
+      this.syncAwaitingUser(params.sessionId);
     };
 
     /** Ends the terminal of a command that ran in the background, once its
@@ -3824,6 +3854,7 @@ export class ClaudeAcpAgent {
     /** Settles a task. */
     const settleLiveTask = (taskId: string) => {
       settleLiveBackgroundTask(session, taskId);
+      this.syncAwaitingUser(params.sessionId);
     };
 
     /** Registers a settled subagent again when the SDK resumes it without a
@@ -3898,7 +3929,7 @@ export class ClaudeAcpAgent {
       ) {
         session.activeTurn.deferredSettle = outcome;
         // The hold delays v1's answer; the turn's work ended at its result.
-        this.endForeground(params.sessionId, session.activeTurn);
+        this.endForeground(params.sessionId, session.activeTurn, { outcome });
       } else {
         await settleActive(outcome);
       }
@@ -4303,7 +4334,10 @@ export class ClaudeAcpAgent {
      *  error is the cancel's, not the work's. */
     const failAllTurns = (error: unknown) => {
       disarmForceCancel(session);
-      this.endAutonomousCycle(params.sessionId);
+      this.endAutonomousCycle(
+        params.sessionId,
+        session.cancelled ? { outcome: { stopReason: "cancelled" } } : { error },
+      );
       const active = session.activeTurn;
       const turns = active
         ? [active, ...(session.turnQueue ?? []).filter((t) => t !== active)]
@@ -4483,7 +4517,12 @@ export class ClaudeAcpAgent {
             session.cancelled ? "stopped" : "failed",
             "at end of stream",
           );
-          this.endAutonomousCycle(params.sessionId);
+          this.endAutonomousCycle(
+            params.sessionId,
+            session.cancelled
+              ? { outcome: { stopReason: "cancelled" } }
+              : { error: RequestError.internalError(undefined, SESSION_ENDED_MESSAGE) },
+          );
           await settleActive(
             session.cancelled
               ? cancelledOutcome(session, inFlight)
@@ -4655,6 +4694,7 @@ export class ClaudeAcpAgent {
         }
 
         this.startAutonomousCycle(params.sessionId, session, message);
+        noteTaskTakenIn(session, message);
 
         // From CLI 2.1.270 the state stays `running` while background agents
         // run, so a turn that their notification starts has no `running`
@@ -4886,7 +4926,9 @@ export class ClaudeAcpAgent {
                       await asyncTasks.autonomousTurnEnded("completed");
                     }
                     await closeCycleToolCalls();
-                    this.endAutonomousCycle(params.sessionId);
+                    this.endAutonomousCycle(params.sessionId, {
+                      outcome: { stopReason: session.cancelled ? "cancelled" : "end_turn" },
+                    });
                   }
                   // A non-cancelled turn normally settled at its terminal
                   // `result` already (issue #773), and that result recorded an
@@ -4968,7 +5010,7 @@ export class ClaudeAcpAgent {
                     const steered: Turn = session.activeTurn;
                     steered.deferredSettle = outcome;
                     // A hold delays v1's answer; the turn's work ends here.
-                    this.endForeground(params.sessionId, steered);
+                    this.endForeground(params.sessionId, steered, { outcome });
                     leaveSteerLane(steered);
                     await settleDeferredIfDrained();
                   } else if (session.owedTrailingIdles > 0) {
@@ -5186,6 +5228,7 @@ export class ClaudeAcpAgent {
                   );
                   break;
                 }
+                await jazSubagents?.taskProgress(message);
                 await asyncTasks.taskProgress({
                   task_id: message.task_id,
                   description: message.description,
@@ -5235,6 +5278,7 @@ export class ClaudeAcpAgent {
                   },
                   sendUpdate,
                 );
+                await jazSubagents?.taskStarted(message);
                 await asyncTasks.taskStarted({
                   task_id: message.task_id,
                   task_type: message.task_type,
@@ -5266,6 +5310,7 @@ export class ClaudeAcpAgent {
                   message.tool_use_id,
                   { reason: message.reason },
                 );
+                await jazSubagents?.taskNotification(message);
                 await asyncTasks.taskNotification({
                   task_id: message.task_id,
                   status: message.status,
@@ -5292,12 +5337,14 @@ export class ClaudeAcpAgent {
                   );
                   break;
                 }
+                await jazSubagents?.taskUpdated(message);
                 await asyncTasks.taskUpdated(message.task_id, message.patch);
                 // A task moved to the background no longer blocks the tool
                 // call that spawned it.
                 if (message.patch.is_backgrounded !== undefined) {
                   const task = session.liveBackgroundTasks.get(message.task_id);
                   if (task) task.backgrounded = message.patch.is_backgrounded;
+                  this.syncAwaitingUser(params.sessionId);
                 }
                 // terminal-status task_updated patch and a (deduplicated)
                 // task_notification when a task settles, but only the patch is
@@ -5722,7 +5769,6 @@ export class ClaudeAcpAgent {
                 matchingModelUsage.usage.contextWindow > 0
               ) {
                 session.contextWindowSize = matchingModelUsage.usage.contextWindow;
-                session.contextWindowAuthoritative = true;
                 // Authoritative: fold it into the cross-session cache (see
                 // `cacheResultContextWindow`).
                 cacheResultContextWindow(
@@ -5775,7 +5821,14 @@ export class ClaudeAcpAgent {
                   pendingExitPlanModeInterruption?.toolUseId;
               if (!continuesPlan && !(isAutonomousResult && message.num_turns === 0)) {
                 await closeCycleToolCalls();
-                this.endAutonomousCycle(params.sessionId);
+                this.endAutonomousCycle(
+                  params.sessionId,
+                  autonomousCycleEnd(
+                    message,
+                    resultModelUsage,
+                    session.cancelled || exitPlanInterruption || isAbortedResult(message),
+                  ),
+                );
               }
 
               if (session.cancelled) {
@@ -6982,6 +7035,7 @@ export class ClaudeAcpAgent {
             });
             subagents.clear();
             asyncTasks.clear();
+            jazSubagents?.clear();
             session.resolvedToolNames?.clear();
             session.eagerToolCallSessions?.clear();
             session.toolCallFields?.clear();
@@ -7656,7 +7710,7 @@ export class ClaudeAcpAgent {
     }
     // The turns end before this returns; so does a model cycle that Claude
     // Code started on its own, which no turn waits for.
-    this.endAutonomousCycle(sessionId);
+    this.endAutonomousCycle(sessionId, { outcome: { stopReason: "cancelled" } });
     // cancel() arms the force-cancel floor and interrupts gracefully, but a
     // wedged consumer only wakes when `cancelController` aborts — closeQueryStream
     // below doesn't touch it. Since we're tearing the session down anyway, wake
@@ -7703,7 +7757,8 @@ export class ClaudeAcpAgent {
       // Foreground work that no turn owns, such as a cycle that Claude Code
       // started after the endAutonomousCycle call above.
       const owner = this.foregroundWork.get(sessionId);
-      if (owner) this.endForeground(sessionId, owner);
+      if (owner)
+        this.endForeground(sessionId, owner.owner, { outcome: { stopReason: "cancelled" } });
     }
   }
 
@@ -8413,10 +8468,12 @@ export class ClaudeAcpAgent {
     if (!session) return request();
     const input: OpenUserInput = agentID !== undefined ? { agentID } : {};
     (session.openUserInputs ??= new Set()).add(input);
+    this.syncAwaitingUser(sessionId);
     try {
       return await request();
     } finally {
       session.openUserInputs.delete(input);
+      this.syncAwaitingUser(sessionId);
     }
   }
 
@@ -8434,13 +8491,37 @@ export class ClaudeAcpAgent {
    *  `owner`: a turn takes over a cycle that Claude Code started on its own,
    *  and only the owner's end ends the work. */
   private startForeground(sessionId: string, owner: ForegroundOwner): void {
-    this.foregroundWork.set(sessionId, owner);
+    const current = this.foregroundWork.get(sessionId);
+    if (current) {
+      current.owner = owner;
+      return;
+    }
+    const events = this.foregroundEvents?.(sessionId);
+    this.foregroundWork.set(sessionId, { owner, events, awaitingUser: false });
+    events?.running();
+    this.syncAwaitingUser(sessionId);
   }
 
   /** End the foreground work of the session `sessionId`, if `owner` is that
    *  work. */
-  private endForeground(sessionId: string, owner: ForegroundOwner): void {
-    if (this.foregroundWork.get(sessionId) === owner) this.foregroundWork.delete(sessionId);
+  private endForeground(sessionId: string, owner: ForegroundOwner, end: WorkEnd): void {
+    const work = this.foregroundWork.get(sessionId);
+    if (work?.owner !== owner) return;
+    this.foregroundWork.delete(sessionId);
+    work.events?.end(end);
+  }
+
+  private syncAwaitingUser(sessionId: string): void {
+    const work = this.foregroundWork.get(sessionId);
+    const session = this.sessions[sessionId];
+    if (!work || !session || session.cancelled) return;
+    const awaitingUser = [...(session.openUserInputs ?? [])].some((input) =>
+      blocksForeground(session, input.agentID),
+    );
+    if (work.awaitingUser === awaitingUser) return;
+    work.awaitingUser = awaitingUser;
+    if (awaitingUser) work.events?.awaitingUser();
+    else work.events?.running();
   }
 
   /** Start a model cycle that Claude Code started on its own as the foreground
@@ -8537,14 +8618,14 @@ export class ClaudeAcpAgent {
 
   /** End the session's model cycle that Claude Code started on its own, if one
    *  runs. */
-  private endAutonomousCycle(sessionId: string): void {
-    this.endForeground(sessionId, AUTONOMOUS_CYCLE);
+  private endAutonomousCycle(sessionId: string, end: WorkEnd): void {
+    this.endForeground(sessionId, AUTONOMOUS_CYCLE, end);
   }
 
   /** Whether a model cycle that Claude Code started on its own is the session's
    *  foreground work. A turn that took a cycle over owns the work from then on. */
   private runsAutonomousCycle(sessionId: string): boolean {
-    return this.foregroundWork.get(sessionId) === AUTONOMOUS_CYCLE;
+    return this.foregroundWork.get(sessionId)?.owner === AUTONOMOUS_CYCLE;
   }
 
   /** The ACP turn that owns a root request of the session now, if any. A
@@ -9312,37 +9393,6 @@ export class ClaudeAcpAgent {
     });
   }
 
-  /**
-   * Replace the default context window with `getContextUsage().rawMaxTokens`
-   * (`readContextWindow`), without blocking the caller. Without it, a model
-   * with a 200K window (`claude-sonnet-4-5`, or any model under
-   * `CLAUDE_CODE_DISABLE_1M_CONTEXT=1`) would show the 1M default until the
-   * first result's modelUsage arrives. A later result still overwrites this.
-   */
-  private refreshContextWindowInBackground(sessionId: string, session: Session): void {
-    if (session.contextWindowAuthoritative) return;
-    const { query } = session;
-    const modelId = session.models.currentModelId;
-    const stillCurrent = () =>
-      this.sessions[sessionId] === session &&
-      session.query === query &&
-      session.models.currentModelId === modelId;
-    // A synchronous throw must not fail the caller either.
-    Promise.resolve()
-      .then(() => readContextWindow(query))
-      .then(
-        (window) => {
-          if (!stillCurrent() || session.contextWindowAuthoritative) return;
-          if (window === undefined) return;
-          session.contextWindowSize = window;
-          session.contextWindowAuthoritative = true;
-        },
-        (error) => {
-          if (stillCurrent()) this.logger.error("Failed to read the context window:", error);
-        },
-      );
-  }
-
   private async applyConfigOptionValue(
     sessionId: string,
     session: Session,
@@ -9369,7 +9419,6 @@ export class ClaudeAcpAgent {
         // the switch is done (`refreshContextWindowInBackground`).
         const seeded = immediateContextWindow(session.providerCacheKey, value, newModelInfo);
         session.contextWindowSize = seeded.size;
-        session.contextWindowAuthoritative = seeded.authoritative;
       }
       session.models = { ...session.models, currentModelId: value };
 
@@ -9385,18 +9434,15 @@ export class ClaudeAcpAgent {
 
       // Rebuild config options since effort levels depend on the selected
       // model (see `effortForModelSwitch`).
-      const effortOpt = session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
       const useRecommendedValue = clientSupportsRecommendedConfigValue(this.clientCapabilities);
       const effortSwitch = effortForModelSwitch({
         state: { pinned: session.effortPinnedLevel, applied: session.appliedEffortLevel },
-        displayed: typeof effortOpt?.currentValue === "string" ? effortOpt.currentValue : undefined,
         newModelInfo,
         modelId: value,
         settings: mergeEffortSettings(
           session.settingsManager.getSettings(),
           session.effortSettingsOverride,
         ),
-        useRecommendedValue,
       });
       session.configOptions = buildConfigOptions(
         session.modes,
@@ -9434,7 +9480,6 @@ export class ClaudeAcpAgent {
         effortSwitch,
         session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID),
         session.ultracodeEnabled,
-        useRecommendedValue,
         (settings) => session.query.applyFlagSettings(settings),
       );
       session.effortPinnedLevel = effort.state.pinned;
@@ -9459,8 +9504,6 @@ export class ClaudeAcpAgent {
         if (duringSetup) this.sessionModes.deferFallbackWarning(session);
         else await this.sessionModes.publishFallbackState(sessionId, session);
       }
-      // Last, so the switch's own control requests don't queue behind it.
-      if (modelChanged) this.refreshContextWindowInBackground(sessionId, session);
     } else if (configId === AGENT_CONFIG_ID) {
       // Live agent switch — no subprocess restart needed. Apply the SDK flag
       // first so a rejected control request leaves both `currentAgent` and the
@@ -9479,10 +9522,10 @@ export class ClaudeAcpAgent {
       // Apply first so a rejected control request cannot leave the displayed
       // value ahead of the SDK flag layer.
       await session.query.applyFlagSettings(effortFlagSettings(value, session.ultracodeEnabled));
+      session.appliedEffortLevel = value !== "default" ? value : undefined;
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
-      session.appliedEffortLevel = value !== "default" ? value : undefined;
       // "Default" clears the flag layer (toSdkEffortLevel → null), handing
       // effort back to the CLI's persisted per-model resolution — so it
       // un-pins; any other pick pins effort for the session.
@@ -9511,9 +9554,8 @@ export class ClaudeAcpAgent {
     // (handles display names and `resolvedModel` ids). The switched-to model
     // may not be among the options — e.g. excluded by the user's
     // `availableModels` allowlist — in which case we track the raw id.
-    // `buildModelConfigOption` then lists that id as an extra entry, so the
-    // picker shows what the SDK is running and a client can send it back.
-    const resolved = resolveModelPreference(session.modelInfos, switchedModel);
+    // `buildModelConfigOption` lists that id so the picker stays truthful.
+    const resolved = resolveReportedModel(session.modelInfos, switchedModel);
     const value = resolved?.value ?? switchedModel;
     if (session.models.currentModelId === value) return;
 
@@ -10338,10 +10380,6 @@ export class ClaudeAcpAgent {
         disabledReason: fastModeDisabledReason,
       };
 
-      // Concrete effort must also be applied to the SDK: its automatic default
-      // need not be our "medium" recommendation. Preserve explicit SDK options
-      // and persisted settings; automatic values re-seed on every model switch.
-      // Legacy clients still leave effort resolution entirely to the CLI.
       const useRecommendedValue = clientSupportsRecommendedConfigValue(this.clientCapabilities);
       const effortSettings = mergeEffortSettings(
         settingsManager.getSettings(),
@@ -10380,21 +10418,9 @@ export class ClaudeAcpAgent {
         return { sessionId, modes, configOptions };
       }
       const initialEffort = configOptions.find((option) => option.id === EFFORT_CONFIG_ID);
-      if (useRecommendedValue && typeof initialEffort?.currentValue === "string") {
-        await q.applyFlagSettings(effortFlagSettings(initialEffort.currentValue, ultracodeEnabled));
-      }
-      // Seed the context window without awaited IPC. The cached authoritative
-      // window from a prior turn wins (`result.modelUsage`, cross-session),
-      // then the default. The default is replaced by a background
-      // getContextUsage once the session is registered
-      // (`refreshContextWindowInBackground`, issue #596); the authoritative
-      // window then arrives on the first `result.modelUsage` and is cached
-      // from there.
-      //
-      // The cache lookup is deliberately keyed to the allowlisted entry: a
-      // fallback-resolved sibling's resolvedModel can name a different context
-      // lane than the verbatim live id (e.g. an "opus[1m]" row matched for a
-      // bare 200k id), so on the fallback path the lookup uses the id itself.
+      // Seed only from prior provider reports; a cache miss stays unknown.
+      // A fallback sibling can name a different context lane, so use the
+      // live model id when no allowlisted entry describes it.
       const seededWindow = immediateContextWindow(
         providerCacheKey,
         models.currentModelId,
@@ -10436,13 +10462,6 @@ export class ClaudeAcpAgent {
           initialEffort?.currentValue === userProvidedOptions.effort
             ? userProvidedOptions.effort
             : undefined,
-        appliedEffortLevel:
-          useRecommendedValue && typeof initialEffort?.currentValue === "string"
-            ? initialEffort.currentValue
-            : userProvidedOptions?.effort !== undefined &&
-                initialEffort?.currentValue === userProvidedOptions.effort
-              ? userProvidedOptions.effort
-              : undefined,
         agents,
         currentAgent,
         fastModeEnabled,
@@ -10453,7 +10472,6 @@ export class ClaudeAcpAgent {
         emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
         forwardSubagentText,
         contextWindowSize: seededWindow.size,
-        contextWindowAuthoritative: seededWindow.authoritative,
         providerCacheKey,
         taskState,
         subagentChecklists: creationOpts.replayState?.subagentChecklists ?? new Set(),
@@ -10506,7 +10524,6 @@ export class ClaudeAcpAgent {
         { env },
       );
       timing.phase("register");
-      this.refreshContextWindowInBackground(sessionId, this.sessions[sessionId]);
 
       return {
         sessionId,
@@ -11054,7 +11071,18 @@ export function v1AgentApp(
   let agent!: ClaudeAcpAgent;
   const app = acpAgent({ name: "claude-code-acp" })
     .onConnect((connection) => {
-      agent = new ClaudeAcpAgent(new ClientConnection(connection.client), logger);
+      const client = new ClientConnection(connection.client);
+      agent = new ClaudeAcpAgent(client, logger, {
+        foreground: (sessionId) =>
+          jazWorkState(
+            sessionId,
+            (notification) =>
+              client
+                .sessionUpdate(notification)
+                .catch((error) => agent.logger.error("Failed to report Jaz work state:", error)),
+            () => agent.sessions[sessionId],
+          ),
+      });
       onAgent(agent);
     })
     .onRequest(methods.agent.initialize, (ctx) => agent.initialize(ctx.params))
@@ -11086,6 +11114,11 @@ export function v1AgentApp(
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
     .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
       agent.steer(ctx.params),
+    )
+    .onRequest<McpRefreshRequest, Record<string, never>>(
+      MCP_REFRESH_METHOD,
+      { parse: parseMcpRefreshRequest },
+      (ctx) => agent.refreshMcpServers(ctx.params),
     )
     .onRequest<AsyncTaskStopRequest, AsyncTaskStopResponse>(
       ASYNC_TASK_STOP_METHOD,

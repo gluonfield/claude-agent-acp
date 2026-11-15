@@ -2778,8 +2778,18 @@ describe("ACP v2 core", () => {
       });
       claude.send(echo(await claude.prompt(0)));
       await prompted;
+      const previous = assistant("msg_previous", []);
+      claude.send({ ...previous, message: { ...previous.message, model: "claude-sonnet-4-6" } });
+      claude.send(result({ modelUsage: { "claude-sonnet-4-6": { contextWindow: 1_000_000 } } }));
+      await vi.waitFor(() =>
+        expect(
+          client.sessionUpdates.some(
+            (update) => update.sessionUpdate === "usage_update" && update.size === 1_000_000,
+          ),
+        ).toBe(true),
+      );
       const planned = assistant("msg_1", [{ type: "text", text: "Planned." }]);
-      // Half of the default 1M window.
+      // Half of the window Claude Code reported.
       planned.message.usage = { input_tokens: 500_000, output_tokens: 0 };
       claude.send(planned);
       await vi.waitFor(() =>
@@ -3884,7 +3894,7 @@ describe("ACP v2 core", () => {
       ["is AIR without recommendedValue", air(), false],
       ["is not AIR", {}, false],
     ])(
-      "names the recommended model and effort only for a client that %s, and applies the effort",
+      "recommends the model for a client that %s and leaves effort at native Default",
       async (_, capabilities, recommended) => {
         const levels = ["low", "medium", "high"];
         sdk.models = [
@@ -3923,20 +3933,14 @@ describe("ACP v2 core", () => {
             currentValue: "opus",
             _meta: airMeta({ recommendedValue: "opus" }),
           });
-          expect(values("effort")).toEqual(levels);
-          expect(option("effort")).toMatchObject({
-            currentValue: "medium",
-            _meta: airMeta({ recommendedValue: "medium" }),
-          });
-          // The shown effort is the one Claude uses.
-          expect(claude.applyFlagSettings).toHaveBeenCalledWith({ effortLevel: "medium" });
         } else {
           expect(values("model")).toContain("default");
           expect(option("model")._meta).toBeUndefined();
-          expect(values("effort")).toEqual(["default", ...levels]);
-          expect(option("effort")._meta).toBeUndefined();
-          expect(claude.applyFlagSettings).not.toHaveBeenCalled();
         }
+        expect(values("effort")).toEqual(["default", ...levels]);
+        expect(option("effort")).toMatchObject({ currentValue: "default" });
+        expect(option("effort")._meta).toBeUndefined();
+        expect(claude.applyFlagSettings).not.toHaveBeenCalled();
       },
     );
 

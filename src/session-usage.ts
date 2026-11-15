@@ -30,14 +30,8 @@ export const ZERO_USAGE = Object.freeze({
   cache_creation_input_tokens: 0,
 });
 
-/**
- * The context window reported for a model until Claude Code says what it is
- * (see `context-window.ts`): 1M, the window Claude Code itself assumes for a
- * model id it does not know (since 2.1.323). Claude Code reports 200K for an
- * older model such as `claude-sonnet-4-5`, and for every model under
- * `CLAUDE_CODE_DISABLE_1M_CONTEXT=1`.
- */
-export const DEFAULT_CONTEXT_WINDOW = 1_000_000;
+/** Zero until Claude Code reports the model context window. */
+export const DEFAULT_CONTEXT_WINDOW = 0;
 
 /** `_meta.quota` for work that spent `usage` in its main agent loop and
  *  `modelUsage` by model (see `turnQuotaMeta` in `v1/acp-agent.ts`). */
@@ -211,36 +205,19 @@ export function snapshotFromUsage(usage: {
   };
 }
 
-function commonPrefixLength(a: string, b: string) {
-  let i = 0;
-  while (i < a.length && i < b.length && a[i] === b[i]) {
-    i++;
-  }
-  return i;
-}
-
 export function getMatchingModelUsage(
   modelUsage: Record<string, ModelUsage>,
   currentModel: string,
 ) {
-  let bestKey: string | null = null;
-  let bestLen = 0;
-
-  for (const key of Object.keys(modelUsage)) {
-    const len = commonPrefixLength(key, currentModel);
-    if (len > bestLen) {
-      bestLen = len;
-      bestKey = key;
-    }
+  if (Object.hasOwn(modelUsage, currentModel)) {
+    return { key: currentModel, usage: modelUsage[currentModel] };
   }
-
-  if (bestKey) {
-    // `bestKey` is the SDK's resolved model id (e.g. "claude-sonnet-5[1m]"),
-    // the same spelling as ModelInfo.resolvedModel — the primary key the
-    // window is cached under. `currentModel` (the assistant message's
-    // `.model`) can be the bare form (e.g. "claude-sonnet-5"); the result
-    // handler caches under that spelling too, for seed-time reads that fall
-    // back to a bare id (rows without `resolvedModel`).
-    return { key: bestKey, usage: modelUsage[bestKey] };
+  const canonical = (model: string) => model.replace(/\[1m\]$/, "").replace(/-\d{8}$/, "");
+  const matches = Object.keys(modelUsage).filter(
+    (key) => canonical(key) === canonical(currentModel),
+  );
+  if (matches.length === 1) {
+    const key = matches[0];
+    return { key, usage: modelUsage[key] };
   }
 }

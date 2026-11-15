@@ -102,7 +102,7 @@ describe("ClaudeAcpAgent settings", () => {
   it.each([
     { recommended: false, setting: undefined, explicit: undefined, expected: "default" },
     { recommended: false, setting: "low", explicit: "high", expected: "high" },
-    { recommended: true, setting: undefined, explicit: undefined, expected: "medium" },
+    { recommended: true, setting: undefined, explicit: undefined, expected: "default" },
     { recommended: true, setting: "high", explicit: undefined, expected: "high" },
     { recommended: true, setting: "high", explicit: "max", expected: "max" },
   ])(
@@ -144,15 +144,8 @@ describe("ClaudeAcpAgent settings", () => {
       expect(
         response.configOptions.find((option: any) => option.id === "effort").currentValue,
       ).toBe(expected);
-      if (recommended) {
-        expect(applyFlagSettings).toHaveBeenCalledWith({ effortLevel: expected });
-      } else {
-        expect(applyFlagSettings).not.toHaveBeenCalled();
-      }
+      expect(applyFlagSettings).not.toHaveBeenCalled();
       expect(agent.sessions[response.sessionId].effortPinnedLevel).toBe(explicit);
-      expect(agent.sessions[response.sessionId].appliedEffortLevel).toBe(
-        recommended ? expected : explicit,
-      );
     },
   );
 
@@ -191,7 +184,7 @@ describe("ClaudeAcpAgent settings", () => {
       mcpServers: [],
       _meta: { disableBuiltInTools: true },
     });
-    expect(applyFlagSettings).toHaveBeenLastCalledWith({ effortLevel: "medium", ultracode: true });
+    expect(applyFlagSettings).not.toHaveBeenCalled();
 
     await agent.setSessionConfigOption({
       sessionId: response.sessionId,
@@ -252,7 +245,7 @@ describe("ClaudeAcpAgent settings", () => {
     expect(response.configOptions.find((option: any) => option.id === "effort").currentValue).toBe(
       "low",
     );
-    expect(applyFlagSettings).toHaveBeenCalledWith({ effortLevel: "low" });
+    expect(applyFlagSettings).not.toHaveBeenCalled();
     expect(agent.sessions[response.sessionId].effortSettingsOverride?.effortLevel).toBe("medium");
   });
 

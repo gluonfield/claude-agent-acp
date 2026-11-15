@@ -614,7 +614,6 @@ describe("session config options", () => {
       const session = agent.sessions[SESSION_ID];
       expect(session.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("default");
       expect(session.effortPinnedLevel).toBeUndefined();
-      expect(session.appliedEffortLevel).toBeUndefined();
     });
 
     it("throws for invalid effort value", async () => {
@@ -659,7 +658,7 @@ describe("session config options", () => {
       populateSession();
     });
 
-    it("applies concrete defaults and re-seeds automatic effort from each model's settings", async () => {
+    it("leaves automatic effort with the SDK across model switches", async () => {
       (agent as any).clientCapabilities = {
         _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
       };
@@ -672,30 +671,22 @@ describe("session config options", () => {
         configId: "model",
         value: "claude-sonnet-4-6",
       });
-      expect(response.configOptions.find((o) => o.id === "effort")).toMatchObject({
-        currentValue: "medium",
-        _meta: { jetbrains: { air: { recommendedValue: "medium" } } },
-      });
-      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: "medium" });
+      const effort = response.configOptions.find((option) => option.id === "effort");
+      expect(effort?.currentValue).toBe("default");
+      expect(effort?._meta).toBeUndefined();
+      expect(applyFlagSettingsSpy).not.toHaveBeenCalled();
       expect(session.effortPinnedLevel).toBeUndefined();
-      expect(session.appliedEffortLevel).toBe("medium");
 
-      await agent.setSessionConfigOption({
+      const switched = await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
         configId: "model",
         value: "claude-opus-4-5",
       });
-      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: "high" });
+      expect(switched.configOptions.find((option) => option.id === "effort")?.currentValue).toBe(
+        "high",
+      );
+      expect(applyFlagSettingsSpy).not.toHaveBeenCalled();
       expect(session.effortPinnedLevel).toBeUndefined();
-      expect(session.appliedEffortLevel).toBe("high");
-
-      session.modelInfos[1].supportsEffort = false;
-      await agent.setSessionConfigOption({
-        sessionId: SESSION_ID,
-        configId: "model",
-        value: "claude-sonnet-4-6",
-      });
-      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: null });
     });
 
     it("re-seeds switches from retained programmatic settings before file settings", async () => {
@@ -716,28 +707,34 @@ describe("session config options", () => {
       });
 
       expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
-      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: "low" });
+      expect(applyFlagSettingsSpy).not.toHaveBeenCalled();
     });
 
-    it("clears an unsupported user pin before choosing the new model's concrete effort", async () => {
-      (agent as any).clientCapabilities = {
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-      };
-      const session = agent.sessions[SESSION_ID];
-      session.modelInfos[0].supportedEffortLevels = ["low", "medium", "high", "max"];
-      session.settingsManager.getSettings = () => ({ effortLevel: "low" });
-      session.configOptions.find((o) => o.id === "effort")!.currentValue = "max";
-      session.effortPinnedLevel = "max";
-      const response = await agent.setSessionConfigOption({
-        sessionId: SESSION_ID,
-        configId: "model",
-        value: "claude-sonnet-4-6",
-      });
-      expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
-      expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: "low" });
-      expect(session.effortPinnedLevel).toBeUndefined();
-      expect(session.appliedEffortLevel).toBe("low");
-    });
+    it.each([false, true])(
+      "clears an unsupported user pin with ultracode=%s",
+      async (ultracode) => {
+        (agent as any).clientCapabilities = {
+          _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
+        };
+        const session = agent.sessions[SESSION_ID];
+        session.modelInfos[0].supportedEffortLevels = ["low", "medium", "high", "max"];
+        session.settingsManager.getSettings = () => ({ effortLevel: "low", ultracode });
+        session.ultracodeEnabled = ultracode;
+        session.configOptions.find((o) => o.id === "effort")!.currentValue = "max";
+        session.effortPinnedLevel = "max";
+        const response = await agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "model",
+          value: "claude-sonnet-4-6",
+        });
+        expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
+        expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({
+          effortLevel: null,
+          ...(ultracode ? { ultracode: true } : {}),
+        });
+        expect(session.effortPinnedLevel).toBeUndefined();
+      },
+    );
 
     it("clears a legacy pin without promoting persisted effort to a flag override", async () => {
       const session = agent.sessions[SESSION_ID];
@@ -755,7 +752,6 @@ describe("session config options", () => {
       expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
       expect(applyFlagSettingsSpy).toHaveBeenLastCalledWith({ effortLevel: null });
       expect(session.effortPinnedLevel).toBeUndefined();
-      expect(session.appliedEffortLevel).toBeUndefined();
     });
 
     it("retains the original pin value when a legacy clamp fails", async () => {
@@ -782,31 +778,11 @@ describe("session config options", () => {
       expect(session.effortPinnedLevel).toBe("max");
     });
 
-    it("restores the last applied effort when recommended-value synchronization fails", async () => {
-      (agent as any).clientCapabilities = {
-        _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-      };
-      const session = agent.sessions[SESSION_ID];
-      session.configOptions.find((o) => o.id === "effort")!.currentValue = "low";
-      session.appliedEffortLevel = "low";
-      session.settingsManager.getSettings = () => ({ effortLevel: "high" });
-      applyFlagSettingsSpy.mockRejectedValueOnce(new Error("effort sync failed"));
-
-      const response = await agent.setSessionConfigOption({
-        sessionId: SESSION_ID,
-        configId: "model",
-        value: "claude-sonnet-4-6",
-      });
-
-      expect(response.configOptions.find((o) => o.id === "effort")?.currentValue).toBe("low");
-      expect(session.appliedEffortLevel).toBe("low");
-      expect(session.effortPinnedLevel).toBeUndefined();
-    });
-
     it("returns the new model state when effort synchronization fails", async () => {
       (agent as any).clientCapabilities = {
         _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
       };
+      agent.sessions[SESSION_ID].effortPinnedLevel = "max";
       applyFlagSettingsSpy.mockRejectedValueOnce(new Error("effort sync failed"));
 
       const response = await agent.setSessionConfigOption({
@@ -815,6 +791,7 @@ describe("session config options", () => {
         value: "claude-sonnet-4-6",
       });
 
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
       expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-6");
       expect(response.configOptions.find((o) => o.id === "model")?.currentValue).toBe(
         "claude-sonnet-4-6",
@@ -828,9 +805,11 @@ describe("session config options", () => {
       };
       applyFlagSettingsSpy.mockRejectedValueOnce(new Error("effort sync failed"));
       const session = agent.sessions[SESSION_ID];
+      session.effortPinnedLevel = "max";
 
       await (agent as any).syncModelAfterExternalSwitch(SESSION_ID, session, "claude-sonnet-4-6");
 
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
       expect(setModelSpy).not.toHaveBeenCalled();
       expect(session.models.currentModelId).toBe("claude-sonnet-4-6");
       expect(
@@ -1216,57 +1195,22 @@ describe("session config options", () => {
       return (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
     }
 
-    it("seeds the default window on model switch, then replaces it in the background", async () => {
+    it("clears the old window and keeps an unreported model window unknown without IPC", async () => {
       const session = getSession();
-      // The window learned for the previous model.
-      session.contextWindowSize = 200000;
-      let answer!: (usage: { rawMaxTokens: number }) => void;
-      session.query.getContextUsage = vi.fn(
-        () => new Promise<{ rawMaxTokens: number }>((resolve) => (answer = resolve)),
+      session.contextWindowSize = 1_000_000;
+      session.query.getContextUsage = vi.fn(() => new Promise<never>(() => {}));
+      session.modelInfos = session.modelInfos.map((model: ModelInfo) =>
+        model.value === "claude-sonnet-4-6"
+          ? { ...model, resolvedModel: "claude-sonnet-5[1m]" }
+          : model,
       );
-
       await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
         configId: "model",
         value: "claude-sonnet-4-6",
       });
-
-      // The switch resolved without waiting for getContextUsage.
-      expect(session.query.getContextUsage).toHaveBeenCalledOnce();
-      expect(session.query.getContextUsage).toHaveBeenCalledWith({ detail: "summary" });
-      expect(session.contextWindowSize).toBe(1_000_000);
-      expect(session.contextWindowAuthoritative).toBe(false);
-
-      answer({ rawMaxTokens: 967000 });
-      await vi.waitFor(() => expect(session.contextWindowSize).toBe(967000));
-      expect(session.contextWindowAuthoritative).toBe(true);
-    });
-
-    it("drops a background answer that arrives after another switch", async () => {
-      const session = getSession();
-      let answer!: (usage: { rawMaxTokens: number }) => void;
-      session.query.getContextUsage = vi.fn(
-        () => new Promise<{ rawMaxTokens: number }>((resolve) => (answer = resolve)),
-      );
-
-      await agent.setSessionConfigOption({
-        sessionId: SESSION_ID,
-        configId: "model",
-        value: "claude-sonnet-4-6",
-      });
-      const staleAnswer = answer;
-      await agent.setSessionConfigOption({
-        sessionId: SESSION_ID,
-        configId: "model",
-        value: "claude-opus-4-5",
-      });
-      const windowAfterSecondSwitch = session.contextWindowSize;
-
-      staleAnswer({ rawMaxTokens: 967000 });
-      await new Promise((resolve) => setImmediate(resolve));
-
-      expect(session.contextWindowSize).toBe(windowAfterSecondSwitch);
-      expect(session.contextWindowAuthoritative).toBe(false);
+      expect(session.query.getContextUsage).not.toHaveBeenCalled();
+      expect(session.contextWindowSize).toBe(0);
     });
 
     it("keeps the learned window when re-asserting the current model", async () => {

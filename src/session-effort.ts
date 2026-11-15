@@ -1,6 +1,5 @@
 import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import type { EffortLevel, ModelInfo, Settings } from "@anthropic-ai/claude-agent-sdk";
-import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, withAirMeta } from "./air-extension.js";
 import { EFFORT_CONFIG_ID } from "./session-config-ids.js";
 
 export { EFFORT_CONFIG_ID } from "./session-config-ids.js";
@@ -107,7 +106,6 @@ export function buildEffortConfigOption(
   modelInfos: ModelInfo[],
   currentModelId: string,
   currentEffortLevel: string | undefined,
-  useRecommendedValue: boolean,
 ): SessionConfigOption | undefined {
   const currentModelInfo = modelInfos.find((model) => model.value === currentModelId);
   const supportedLevels = currentModelInfo?.supportsEffort
@@ -115,24 +113,15 @@ export function buildEffortConfigOption(
     : [];
   if (supportedLevels.length === 0) return undefined;
 
-  const recommendedEffort = (supportedLevels as string[]).includes("medium")
-    ? "medium"
-    : supportedLevels[0];
   const options = [
-    ...(useRecommendedValue ? [] : [{ value: "default", name: "Default" }]),
+    { value: "default", name: "Default" },
     ...supportedLevels.map((level) => ({
       value: level,
       name: effortLevelName(level),
     })),
   ];
-  const includes = (level: string) =>
-    (!useRecommendedValue && level === "default") || (supportedLevels as string[]).includes(level);
   const currentValue =
-    currentEffortLevel && includes(currentEffortLevel)
-      ? currentEffortLevel
-      : useRecommendedValue
-        ? recommendedEffort
-        : "default";
+    options.find((option) => option.value === currentEffortLevel)?.value ?? "default";
 
   return {
     id: EFFORT_CONFIG_ID,
@@ -142,11 +131,6 @@ export function buildEffortConfigOption(
     type: "select",
     currentValue,
     options,
-    ...(useRecommendedValue
-      ? {
-          _meta: withAirMeta(undefined, AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, recommendedEffort),
-        }
-      : {}),
   };
 }
 
@@ -178,15 +162,12 @@ export type EffortSwitch = {
  *  will actually run instead of dragging the old model's value along. */
 export function effortForModelSwitch(input: {
   state: EffortState;
-  /** The current value of the effort option, if it is shown. */
-  displayed: string | undefined;
   newModelInfo: ModelInfo | undefined;
   modelId: string;
   /** The merged effort settings (see {@link mergeEffortSettings}). */
   settings: Settings;
-  useRecommendedValue: boolean;
 }): EffortSwitch {
-  const { state, displayed, newModelInfo, useRecommendedValue } = input;
+  const { state, newModelInfo } = input;
   const pinned = state.pinned;
   const pinnedForNewModel =
     pinned !== undefined &&
@@ -198,63 +179,31 @@ export function effortForModelSwitch(input: {
       : settingsEffortForModel(input.settings, newModelInfo, input.modelId),
     pinnedForNewModel,
     before: state,
-    appliedBeforeSwitch:
-      state.applied ??
-      (useRecommendedValue && typeof displayed === "string" && displayed !== "default"
-        ? displayed
-        : pinned),
+    appliedBeforeSwitch: state.applied ?? pinned,
   };
 }
 
-/**
- * Applies the effort of a model switch to the SDK's flag layer, once the new
- * model's effort `option` is built from `change.seed`. Returns the new state
- * and the option to show (undefined to hide it).
- *
- * Opted-in clients (`useRecommendedValue`) apply the concrete displayed effort
- * on every switch, including settings-derived values, so a previous automatic
- * flag cannot shadow the new model's settings. This does not create a user
- * pin. For other clients, the flag is synced only when a user pin is lost
- * across the switch — the new model clamped it away, where the flag must be
- * cleared too or the SDK would keep running the old pin invisibly.
- * Settings-derived seeds are display-only: the CLI resolves persisted effort
- * itself, and pinning it at the flag layer would shadow the per-model values
- * on every later switch.
- *
- * The model switch already succeeded, so a failed sync is returned as
- * `error`, not thrown. The old bookkeeping stays, and the unapplied value is
- * never shown: the option shows the last applied value when the new model can
- * select it, else it is hidden until a later switch rebuilds it.
- */
+/** Clears a user pin that the new model cannot run. Persisted defaults stay with Claude Code. */
 export async function settleEffortAfterModelSwitch(
   change: EffortSwitch,
   option: SessionConfigOption | undefined,
   ultracode: boolean,
-  useRecommendedValue: boolean,
   applyFlagSettings: (settings: ReturnType<typeof effortFlagSettings>) => Promise<void>,
 ): Promise<{ state: EffortState; option: SessionConfigOption | undefined; error?: unknown }> {
   const { pinnedForNewModel, before } = change;
-  const sync = useRecommendedValue || (before.pinned !== undefined && !pinnedForNewModel);
+  const sync = before.pinned !== undefined && !pinnedForNewModel;
   if (!sync) {
     return {
       state: pinnedForNewModel ? { pinned: before.pinned, applied: before.pinned } : before,
       option,
     };
   }
-  const newEffort = typeof option?.currentValue === "string" ? option.currentValue : undefined;
   try {
-    // A legacy client's unpinned effort is display-only: the CLI resolves the
-    // persisted value for the new model. When an old user pin is no longer
-    // supported, clear the flag layer instead of replacing it with that
-    // displayed value. Opted-in clients deliberately apply their concrete
-    // displayed effort.
-    await applyFlagSettings(
-      effortFlagSettings(useRecommendedValue ? newEffort : undefined, ultracode),
-    );
+    await applyFlagSettings(effortFlagSettings(undefined, ultracode));
     return {
       state: {
         pinned: pinnedForNewModel ? before.pinned : undefined,
-        applied: useRecommendedValue && newEffort !== "default" ? newEffort : undefined,
+        applied: undefined,
       },
       option,
     };

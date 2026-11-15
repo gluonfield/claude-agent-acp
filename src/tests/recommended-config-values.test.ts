@@ -133,7 +133,7 @@ describe("buildConfigOptions recommended values presentation", () => {
     expect(effort._meta).toBeUndefined();
   });
 
-  it("omits default entries and advertises concrete recommendations", () => {
+  it("advertises the SDK model recommendation while retaining automatic effort", () => {
     const options = buildConfigOptions(
       MODES,
       MODELS,
@@ -166,11 +166,11 @@ describe("buildConfigOptions recommended values presentation", () => {
     expect(model._meta).toEqual(recommendedMeta("sonnet"));
 
     const effort = selectOption(options, "effort");
-    expect(effort.currentValue).toBe("medium");
-    expect(effort.options).not.toEqual(
+    expect(effort.currentValue).toBe("default");
+    expect(effort.options).toEqual(
       expect.arrayContaining([expect.objectContaining({ value: "default" })]),
     );
-    expect(effort._meta).toEqual(recommendedMeta("medium"));
+    expect(effort._meta).toBeUndefined();
   });
 
   it("preserves explicit selections while keeping independent recommendations", () => {
@@ -191,7 +191,6 @@ describe("buildConfigOptions recommended values presentation", () => {
     });
     expect(selectOption(options, "effort")).toMatchObject({
       currentValue: "high",
-      _meta: recommendedMeta("medium"),
     });
   });
 
@@ -262,7 +261,7 @@ describe("buildConfigOptions recommended values presentation", () => {
     });
   });
 
-  it("uses an available effort when medium is not supported", () => {
+  it("preserves automatic effort when the SDK supplies no default", () => {
     const infos = MODEL_INFOS.map((model) => ({
       ...model,
       supportedEffortLevels: ["high", "max"] as ModelInfo["supportedEffortLevels"],
@@ -277,9 +276,7 @@ describe("buildConfigOptions recommended values presentation", () => {
       undefined,
       RECOMMENDED_PRESENTATION,
     );
-    expect(selectOption(options, "effort")).toMatchObject({
-      currentValue: "high",
-      _meta: recommendedMeta("high"),
-    });
+    expect(selectOption(options, "effort")).toMatchObject({ currentValue: "default" });
+    expect(selectOption(options, "effort")._meta).toBeUndefined();
   });
 });

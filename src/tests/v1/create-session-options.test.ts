@@ -1783,48 +1783,12 @@ describe("createSession options merging", () => {
       return (agent as unknown as { sessions: Record<string, any> }).sessions[sessionId];
     }
 
-    it("does not wait for getContextUsage during session creation", async () => {
-      // SDK control requests are serialized and getContextUsage used to stall
-      // until the first prompt turn, so session/new only kicks it off —
-      // awaiting it inline is what regressed session/new latency in 0.59.0.
+    it("keeps a new model window unknown without pre-turn context IPC", async () => {
       const ctxSpy = vi.fn(() => new Promise<never>(() => {}));
       contextUsageResult = ctxSpy;
-
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
-
-      expect(ctxSpy).toHaveBeenCalledOnce();
-      expect(sessionFor(response.sessionId).contextWindowSize).toBe(1_000_000);
-      expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
-    });
-
-    it("replaces the default window with the one getContextUsage reports, in the background", async () => {
-      contextUsageResult = async () => ({ rawMaxTokens: 967000 });
-
-      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
-
-      await vi.waitFor(() => expect(sessionFor(response.sessionId).contextWindowSize).toBe(967000));
-      expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(true);
-    });
-
-    it("asks for the summary context usage so the CLI sends no count_tokens requests", async () => {
-      // The default `full` detail counts each context category with its own
-      // messages/count_tokens request — a burst that hit rate limits on every
-      // model switch — while only `rawMaxTokens` is needed here.
-      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
-
-      await vi.waitFor(() => expect(contextUsageCalls).toEqual([{ detail: "summary" }]));
-    });
-
-    it("keeps the default window when getContextUsage reports a non-positive size", async () => {
-      const ctxSpy = vi.fn(async () => ({ rawMaxTokens: 0 }));
-      contextUsageResult = ctxSpy;
-
-      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
-      await vi.waitFor(() => expect(ctxSpy).toHaveBeenCalled());
-      await new Promise((resolve) => setImmediate(resolve));
-
-      expect(sessionFor(response.sessionId).contextWindowSize).toBe(1_000_000);
-      expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
+      expect(ctxSpy).not.toHaveBeenCalled();
+      expect(sessionFor(response.sessionId).contextWindowSize).toBe(0);
     });
 
     it("session/load restores the transcript model without waiting for getContextUsage", async () => {
@@ -1870,7 +1834,6 @@ describe("createSession options merging", () => {
         "haiku",
       );
       // Kicked off in the background, never awaited: it never answers here.
-      expect(sessionFor("resumed-model-probe").contextWindowAuthoritative).toBe(false);
       expect(getSessionMessages).toHaveBeenCalledTimes(1);
       expect(getSessionMessages).toHaveBeenCalledWith("resumed-model-probe");
     });

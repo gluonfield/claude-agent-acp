@@ -1,0 +1,57 @@
+name: Release Standalone
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Standalone release version, without leading v"
+        required: true
+        default: "0.107.0-jaz.1"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - run: npm ci
+      - run: npm run check
+      - run: npm run test:run
+      - run: bash script/build-standalone-release.sh "$RELEASE_VERSION" dist/standalone
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+
+      - name: Write checksums
+        run: |
+          cd dist/standalone
+          shasum -a 256 *.tar.gz > SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: Claude ACP ${{ inputs.version }}
+          prerelease: false
+          generate_release_notes: false
+          body: |
+            Claude ACP 0.107.0 with Claude Agent SDK 0.3.325 and Claude Code 2.1.325.
+
+            Preserves Jaz MCP refresh, native effort defaults, provider-reported context windows, and subagent/work-state reporting.
+
+            Includes standalone platform archives and SHA256 checksums.
+          files: |
+            dist/standalone/*.tar.gz
+            dist/standalone/SHA256SUMS

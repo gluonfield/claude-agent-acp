@@ -191,6 +191,8 @@ function system(subtype: string, sessionId: string, fields: Record<string, unkno
   return { type: "system", subtype, uuid: randomUUID(), session_id: sessionId, ...fields };
 }
 
+import { jazWorkState } from "../../v1/work-state.js";
+
 describe("turn events", () => {
   let agent: ClaudeAcpAgent;
   /** Sees each session update; the agent waits until it returns. */
@@ -221,6 +223,72 @@ describe("turn events", () => {
   const prompt = (sessionId: string, text: string) => ({
     sessionId,
     prompt: [{ type: "text" as const, text }],
+  });
+
+  it("reports the work and tasks consumed by a prompt and an autonomous follow-up", async () => {
+    const followup = Promise.withResolvers<void>();
+    scriptQuery(async function* (input, options) {
+      const { value } = await input.next();
+      const id = options.sessionId!;
+      yield echo(value, id);
+      for (const task of ["lint", "build"]) {
+        yield system("task_started", id, {
+          task_id: task,
+          run_id: `run-${task}`,
+          description: task,
+        });
+      }
+      yield {
+        ...echo({ uuid: randomUUID(), message: { role: "user", content: "lint passed" } }, id),
+        origin: { kind: "task-notification", runId: "run-lint" },
+      };
+      yield result(id);
+      yield system("session_state_changed", id, { state: "idle" });
+      await followup.promise;
+      for (const message of streamedText("followup", "Build passed", id)) yield message;
+      yield {
+        ...result(id),
+        origin: { kind: "task-notification", runId: "run-build" },
+        usage: {
+          input_tokens: 7,
+          output_tokens: 4,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      };
+      yield system("session_state_changed", id, { state: "idle" });
+      await input.next();
+    });
+    const states: Record<string, unknown>[] = [];
+    const trace: string[] = [];
+    const send = async (notification: SessionNotification) => {
+      const state = notification.update._meta?.jaz as
+        { stateUpdate?: Record<string, unknown> } | undefined;
+      if (state?.stateUpdate) {
+        states.push(state.stateUpdate);
+        trace.push(String(state.stateUpdate.state));
+      }
+    };
+    await agent.dispose();
+    const { ClaudeAcpAgent } = await import("../../v1/acp-agent.js");
+    agent = new ClaudeAcpAgent(
+      { sessionUpdate: send, extNotification: async () => {} } as unknown as AcpClient,
+      undefined,
+      {
+        foreground: (sessionId) => jazWorkState(sessionId, send, () => agent.sessions[sessionId]),
+      },
+    );
+    const sessionId = await newSession();
+    const response = await agent.prompt(prompt(sessionId, "hi"));
+    trace.push(`response ${response.stopReason}`);
+    followup.resolve();
+    await vi.waitFor(() => expect(states).toHaveLength(4));
+    expect(trace).toEqual(["running", "idle", "response end_turn", "running", "idle"]);
+    expect(states.map((state) => state.tasks)).toEqual([[], ["lint"], [], ["build"]]);
+    expect(states.at(-1)).toMatchObject({
+      stopReason: "end_turn",
+      usage: { inputTokens: 7, outputTokens: 4, totalTokens: 11 },
+    });
   });
 
   it("reports a turn as inserted under the uuid of its user message, then ended", async () => {

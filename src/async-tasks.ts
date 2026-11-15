@@ -1093,7 +1093,7 @@ function isBackgroundTask(isBackgrounded: unknown, taskType: unknown): boolean {
   return taskType !== "local_bash" && taskType !== "local_agent";
 }
 
-function isSubagentTask(message: AsyncTaskStarted): boolean {
+export function isSubagentTask(message: AsyncTaskStarted): boolean {
   return (
     field(message, "subagentType", "subagent_type") !== undefined ||
     field(message, "taskType", "task_type") === "local_agent"

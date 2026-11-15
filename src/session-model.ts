@@ -196,26 +196,25 @@ export function resolveModelPreference(models: ModelInfo[], preference: string):
   );
 }
 
-export function matchResumedModel(models: ModelInfo[], liveModel: string): ModelInfo {
-  const live = canonicalizeModelId(liveModel);
-  const defaultEntry = models.find((model) => model.value === "default");
-  const defaultResolved = defaultEntry?.resolvedModel
-    ? canonicalizeModelId(defaultEntry.resolvedModel)
-    : undefined;
-  if (defaultEntry && defaultResolved === live) return defaultEntry;
-  const exactMatch = models.find(
-    (model) => model.resolvedModel && canonicalizeModelId(model.resolvedModel) === live,
+export function resolveReportedModel(models: ModelInfo[], modelId: string): ModelInfo | undefined {
+  const id = canonicalizeModelId(modelId);
+  const exact = models.find(
+    (model) =>
+      canonicalizeModelId(model.value) === id ||
+      (model.resolvedModel !== undefined && canonicalizeModelId(model.resolvedModel) === id),
   );
-  if (exactMatch) return exactMatch;
-  if (
-    defaultEntry &&
-    defaultResolved &&
-    stripContextHints(defaultResolved) === stripContextHints(live)
-  ) {
-    return defaultEntry;
-  }
+  if (exact) return exact;
+  // Native transcripts can omit the SDK's context suffix from the same model identity.
+  return models.find(
+    (model) =>
+      model.resolvedModel !== undefined &&
+      stripContextHints(canonicalizeModelId(model.resolvedModel)) === stripContextHints(id),
+  );
+}
+
+export function matchResumedModel(models: ModelInfo[], liveModel: string): ModelInfo {
   return (
-    resolveModelPreference(models, liveModel) ?? {
+    resolveReportedModel(models, liveModel) ?? {
       value: liveModel,
       displayName: liveModel,
       description: "",

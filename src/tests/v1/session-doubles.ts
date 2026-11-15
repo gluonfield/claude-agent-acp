@@ -88,7 +88,6 @@ export function mockSessionState(
     emitRawSDKMessages: false,
     forwardSubagentText: false,
     contextWindowSize: DEFAULT_CONTEXT_WINDOW,
-    contextWindowAuthoritative: false,
     providerCacheKey: "default",
     taskState: new Map(),
     subagentChecklists: new Set(),
